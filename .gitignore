@@ -1,0 +1,17 @@
+Debug/
+Release/
+
+*.log
+*.map
+*.elf
+*.srec
+*.rpd
+*.sbd
+*.o
+*.d
+
+__pycache__/
+*.py[cod]
+pc_controller/.venv/
+
+pc_controller/controller_config.json

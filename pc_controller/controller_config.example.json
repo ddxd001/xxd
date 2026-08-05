@@ -1,0 +1,18 @@
+{
+  "com_port": "COM3",
+  "baud": 115200,
+  "upper_limit_counts": 0,
+  "speed_scale": 0.2,
+  "gamepad_deadzone": 0.12,
+  "gamepad_axes": {
+    "left_x": 0,
+    "left_y": 1,
+    "right_x": 2
+  },
+  "gamepad_buttons": {
+    "left_shoulder": 4,
+    "right_shoulder": 5,
+    "start": 7,
+    "stop": 1
+  }
+}
