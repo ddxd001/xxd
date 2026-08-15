@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import queue
+import shutil
 import threading
 import time
 
@@ -65,6 +67,81 @@ HOST = "127.0.0.1"
 PORT = 8080
 
 JLINK_VID = 0x1366
+
+# Chat assistant: forwards browser chat messages to a Kimi Code CLI session
+# (which owns the box2robot skill) and relays the reply back.
+KIMI_EXE = shutil.which("kimi") or str(Path.home() / ".kimi-code" / "bin" / "kimi.exe")
+CHAT_WORKDIR = Path.home() / ".kimi-code" / "b2r-chat"
+CHAT_TIMEOUT_S = 180
+
+
+class ChatBridge:
+    """One Kimi Code CLI session shared by all browser clients."""
+
+    def __init__(self) -> None:
+        self.session_id: str | None = None
+        self.busy = False
+
+    @staticmethod
+    def _tool_summary(event: dict) -> str:
+        """Short human-readable summary of a tool call event."""
+        for call in event.get("tool_calls") or []:
+            fn = call.get("function") or {}
+            name = fn.get("name", "tool")
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except ValueError:
+                args = {}
+            detail = args.get("command") or args.get("path") or args.get("prompt") or ""
+            detail = " ".join(str(detail).split())[:120]
+            return f"{name}: {detail}" if detail else name
+        return "tool"
+
+    async def ask_stream(self, text: str, on_event) -> None:
+        """Run one prompt, forwarding assistant segments/tool calls as they happen."""
+        CHAT_WORKDIR.mkdir(parents=True, exist_ok=True)
+        cmd = [KIMI_EXE]
+        if self.session_id:
+            cmd += ["-r", self.session_id]
+        cmd += ["-p", text, "--output-format", "stream-json"]
+        env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(CHAT_WORKDIR),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+
+        async def pump() -> None:
+            assert proc.stdout is not None
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    event = json.loads(line.decode("utf-8", errors="replace"))
+                except ValueError:
+                    continue  # non-JSON chatter (raw tool stdout etc.)
+                role = event.get("role")
+                if role == "assistant":
+                    if event.get("content"):
+                        await on_event({"type": "chat_delta", "text": event["content"]})
+                    if event.get("tool_calls"):
+                        await on_event({"type": "chat_tool", "text": self._tool_summary(event)})
+                elif role == "meta" and event.get("type") == "session.resume_hint":
+                    if event.get("session_id"):
+                        self.session_id = event["session_id"]
+            await proc.wait()
+
+        try:
+            await asyncio.wait_for(pump(), timeout=CHAT_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await on_event({
+                "type": "chat_delta",
+                "text": f"（Kimi Code 超过 {CHAT_TIMEOUT_S} 秒没有响应，已终止；可以点“新会话”重试）",
+            })
 
 
 def load_config() -> dict:
@@ -153,6 +230,8 @@ class RobotBackend:
         self.motion = (0.0, 0.0, 0.0, 0.0)  # raw -1..1 intent from the browser
         self.last_client_msg_at = 0.0
         self.serial_error: str | None = None
+        self.write_failures = 0
+        self.chat = ChatBridge()
 
     # ------------------------------------------------------------------ serial
 
@@ -184,7 +263,7 @@ class RobotBackend:
             if info is not None and info.vid == JLINK_VID:
                 return f"{port_name} 是 J-Link 调试器，不是电脑端 LoRa 串口"
         try:
-            self.port = serial.Serial(port_name, int(self.config["baud"]), timeout=0.05, write_timeout=0.1)
+            self.port = serial.Serial(port_name, int(self.config["baud"]), timeout=0.05, write_timeout=0.5)
         except Exception as exc:
             self.port = None
             return str(exc)
@@ -196,11 +275,13 @@ class RobotBackend:
         self.pending_flags |= FLAG_DISARM
         self.motion = (0.0, 0.0, 0.0, 0.0)
         self.serial_error = None
+        self.write_failures = 0
         self.tx_epoch = time.monotonic()
         self.tx_cycle = 0
         self.tx_next_slot = 0
         self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self.reader_thread.start()
+        print(f"[serial] 已打开 {port_name} @ {int(self.config['baud'])}", flush=True)
         self.config["com_port"] = port_name
         save_config(self.config)
         return None
@@ -231,6 +312,7 @@ class RobotBackend:
                     if frame.message_type == MSG_TELEMETRY:
                         self._threadsafe_put(decode_telemetry(frame.payload))
             except Exception as exc:
+                print(f"[serial] 读取错误: {exc}", flush=True)
                 self._threadsafe_put(exc)
                 break
 
@@ -250,9 +332,16 @@ class RobotBackend:
             return False
         try:
             self.port.write(data)
+            self.write_failures = 0
             return True
         except Exception as exc:
-            self._threadsafe_put(exc)
+            # CH340/USB hubs occasionally stall a single write; only treat
+            # repeated failures as a dead port (read errors still disconnect
+            # immediately in _reader_loop, e.g. when the cable is unplugged).
+            self.write_failures += 1
+            print(f"[serial] write 失败第 {self.write_failures} 次: {exc}", flush=True)
+            if self.write_failures >= 5:
+                self._threadsafe_put(exc)
             return False
 
     async def _send_safe_stop(self, count: int) -> None:
@@ -375,6 +464,18 @@ class RobotBackend:
                 self.pending_flags |= FLAG_DISARM
             await asyncio.sleep(0.2)
 
+    # ------------------------------------------------------------------ chat
+
+    async def handle_chat(self, text: str) -> None:
+        """Relay one browser message to the Kimi Code session and back."""
+        try:
+            await self.chat.ask_stream(text, self.broadcast)
+        except Exception as exc:
+            await self.broadcast({"type": "chat_delta", "text": f"（调用 Kimi Code 失败：{exc}）"})
+        finally:
+            self.chat.busy = False
+        await self.broadcast({"type": "chat_done"})
+
     # ------------------------------------------------------------------ websocket
 
     async def broadcast(self, message: dict) -> None:
@@ -426,6 +527,16 @@ class RobotBackend:
             await self.handle_action(str(message.get("name", "")))
         elif kind == "safe_stop":
             await self._send_safe_stop(3)
+        elif kind == "chat":
+            text = str(message.get("text", "")).strip()
+            if self.chat.busy:
+                await self.broadcast({"type": "chat_status", "text": "上一条消息还在处理中，请稍候…"})
+            elif text:
+                self.chat.busy = True
+                asyncio.create_task(self.handle_chat(text))
+        elif kind == "chat_reset":
+            self.chat.session_id = None
+            await self.broadcast({"type": "chat_reset_done"})
         elif kind == "set_config":
             if "speed_scale" in message:
                 self.config["speed_scale"] = max(0.05, min(1.0, float(message["speed_scale"])))
