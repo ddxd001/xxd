@@ -15,3 +15,6 @@ __pycache__/
 pc_controller/.venv/
 
 pc_controller/controller_config.json
+
+# local AI tool config
+.kimi-code/

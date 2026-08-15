@@ -1,0 +1,1343 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RA8P1 全向底盘控制器</title>
+<script>
+  // Apply theme before first paint to avoid a flash of the wrong theme.
+  (function () {
+    const params = new URLSearchParams(location.search);
+    const saved = params.get("theme") || localStorage.getItem("ra8p1-theme");
+    const dark = saved ? saved === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+  })();
+</script>
+<style>
+  /* Apple Liquid Glass design tokens (per ui-ux-pro-max) */
+  :root {
+    color-scheme: light;
+    --bg: #F5F5F7;
+    --card: rgba(255, 255, 255, 0.72);
+    --card-solid: #FFFFFF;
+    --text: #1D1D1F;
+    --text-secondary: #86868B;
+    --border: rgba(0, 0, 0, 0.06);
+    --accent: #007AFF;
+    --accent-hover: #0066D6;
+    --success: #34C759;
+    --warning: #FF9500;
+    --destructive: #FF3B30;
+    --destructive-hover: #D70015;
+    --control-bg: rgba(0, 0, 0, 0.05);
+    --control-bg-hover: rgba(0, 0, 0, 0.09);
+    --header-bg: rgba(245, 245, 247, 0.72);
+    --pill-idle-bg: rgba(0, 0, 0, 0.06);
+    --pill-idle-text: #48484A;
+    --radius-lg: 24px;
+    --radius-md: 16px;
+    --radius-pill: 980px;
+    --shadow-card: 0 8px 32px rgba(0, 0, 0, 0.08);
+    --shadow-pop: 0 12px 40px rgba(0, 0, 0, 0.16);
+    --glass-blur: blur(20px) saturate(180%);
+    --font: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text",
+            "Inter", "Segoe UI", "PingFang SC", "Hiragino Sans GB",
+            "Microsoft YaHei", sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  }
+
+  /* Dark Mode (OLED) per ui-ux-pro-max: deep black, 7:1+ text contrast */
+  [data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #000000;
+    --card: rgba(28, 28, 30, 0.72);
+    --card-solid: #1C1C1E;
+    --text: #F5F5F7;
+    --text-secondary: #98989D;
+    --border: rgba(255, 255, 255, 0.12);
+    --accent: #0A84FF;
+    --accent-hover: #409CFF;
+    --success: #30D158;
+    --warning: #FF9F0A;
+    --destructive: #FF453A;
+    --destructive-hover: #FF6961;
+    --control-bg: rgba(255, 255, 255, 0.10);
+    --control-bg-hover: rgba(255, 255, 255, 0.16);
+    --header-bg: rgba(0, 0, 0, 0.55);
+    --pill-idle-bg: rgba(255, 255, 255, 0.12);
+    --pill-idle-text: #AEAEB2;
+    --shadow-card: 0 8px 32px rgba(0, 0, 0, 0.50);
+    --shadow-pop: 0 12px 40px rgba(0, 0, 0, 0.60);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+
+  body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 15px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+  }
+
+  /* ---- full-screen 3D stage ---- */
+  #robot-3d {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    background: linear-gradient(180deg, #E8EAF0 0%, #F5F5F7 100%);
+  }
+  [data-theme="dark"] #robot-3d {
+    background: linear-gradient(180deg, #0A0A0C 0%, #000000 100%);
+  }
+  #robot-3d canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+  .viz-hint {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    top: 70px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    background: var(--card);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    padding: 4px 12px;
+    border-radius: var(--radius-pill);
+    border: 1px solid var(--border);
+    pointer-events: none;
+    white-space: nowrap;
+  }
+
+  /* ---- floating glass header ---- */
+  header {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    z-index: 40;
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    background: var(--header-bg);
+    border-bottom: 1px solid var(--border);
+  }
+  .header-inner {
+    padding: 10px 16px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .logo {
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: -0.2px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .logo svg { color: var(--accent); }
+  .header-spacer { flex: 1; }
+
+  select, input[type="number"], input[type="text"] {
+    font-family: var(--font);
+    font-size: 14px;
+    color: var(--text);
+    background: var(--card-solid);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 8px 12px;
+    min-height: 36px;
+    outline: none;
+    transition: border-color 200ms, box-shadow 200ms;
+  }
+  select:focus-visible, input:focus-visible, button:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 4px rgba(0, 122, 255, 0.25);
+    border-color: var(--accent);
+  }
+
+  button {
+    font-family: var(--font);
+    font-size: 14px;
+    font-weight: 500;
+    border: none;
+    border-radius: var(--radius-pill);
+    padding: 8px 18px;
+    min-height: 36px;
+    min-width: 44px;
+    cursor: pointer;
+    color: var(--text);
+    background: var(--control-bg);
+    transition: background 200ms, transform 150ms, box-shadow 200ms, opacity 200ms;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    white-space: nowrap;
+  }
+  button:hover { background: var(--control-bg-hover); }
+  button:active { transform: scale(0.97); }
+  button:disabled { opacity: 0.4; cursor: default; transform: none; }
+  button.primary { background: var(--accent); color: #fff; }
+  button.primary:hover { background: var(--accent-hover); }
+  button.danger { background: var(--destructive); color: #fff; }
+  button.danger:hover { background: var(--destructive-hover); }
+  button.ghost { background: transparent; border: 1px solid var(--border); }
+  button.ghost:hover { background: var(--control-bg); }
+
+  .conn-dot { width: 10px; height: 10px; border-radius: 50%; background: #C7C7CC; flex: none; transition: background 250ms; }
+  .conn-dot.on { background: var(--success); }
+  .conn-dot.warn { background: var(--warning); }
+  .conn-text { font-size: 13px; color: var(--text-secondary); }
+
+  /* ---- floating HUD panels surrounding the 3D stage ---- */
+  .hud-panel {
+    position: fixed;
+    z-index: 10;
+    background: var(--card);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-card);
+    padding: 18px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .hud-panel h2 {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    margin-bottom: 12px;
+  }
+  .hud-left { top: 66px; left: 14px; width: 368px; max-height: calc(100vh - 220px); }
+
+  /* right: enlarged touch pad */
+  .hud-pad {
+    top: 50%;
+    transform: translateY(-50%);
+    right: 14px;
+    padding: 18px 20px;
+  }
+  .hud-pad .pad-wrap { flex-direction: column; gap: 16px; }
+
+  /* bottom: full-width status bar, data fills the width */
+  .hud-statusbar {
+    left: 14px;
+    right: 14px;
+    bottom: 12px;
+    display: flex;
+    align-items: stretch;
+    gap: 26px;
+    flex-wrap: wrap;
+    padding: 18px 24px;
+    min-height: 100px;
+  }
+  .sb-cell { display: flex; flex-direction: column; gap: 7px; min-width: 0; justify-content: center; }
+  .sb-cell .sb-k { font-size: 13px; color: var(--text-secondary); }
+  .sb-cell .sb-v { font-size: 15px; word-break: break-all; }
+  .sb-cell .sb-v.mono { font-family: var(--mono); font-size: 14px; line-height: 1.5; }
+  .sb-lift { flex: 1 1 280px; }
+  .sb-sep { width: 1px; background: var(--border); align-self: stretch; }
+
+  /* status list in the right panel (kept for narrow fallback) */
+  .stat-list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
+  .stat-row { display: flex; align-items: baseline; gap: 10px; font-size: 14.5px; }
+  .stat-row .k { color: var(--text-secondary); width: 64px; flex: none; }
+  .stat-row .v { word-break: break-all; }
+  .stat-row .v.mono { font-family: var(--mono); font-size: 13px; }
+
+  .state-pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 4px 14px; border-radius: var(--radius-pill);
+    font-size: 14px; font-weight: 600;
+  }
+  .state-pill .dot { width: 9px; height: 9px; border-radius: 50%; }
+  .st-idle   { background: var(--pill-idle-bg); color: var(--pill-idle-text); }
+  .st-idle .dot { background: #8E8E93; }
+  .st-active { background: rgba(52,199,89,0.15); color: #248A3D; }
+  .st-active .dot { background: var(--success); }
+  .st-busy   { background: rgba(0,122,255,0.12); color: #0066CC; }
+  .st-busy .dot { background: var(--accent); }
+  .st-warn   { background: rgba(255,149,0,0.15); color: #C93400; }
+  .st-warn .dot { background: var(--warning); }
+  .st-fault  { background: rgba(255,59,48,0.12); color: #D70015; }
+  .st-fault .dot { background: var(--destructive); }
+  [data-theme="dark"] .st-active { color: #30D158; }
+  [data-theme="dark"] .st-busy { color: #409CFF; }
+  [data-theme="dark"] .st-warn { color: #FF9F0A; }
+  [data-theme="dark"] .st-fault { color: #FF6961; }
+
+  /* compact servo telemetry cells filling the status bar */
+  .sb-servos { display: flex; flex: 2 1 560px; gap: 26px; flex-wrap: wrap; }
+  .servo-row { display: flex; flex-direction: column; gap: 6px; flex: 1 1 150px; min-width: 0; justify-content: center; }
+  .servo-row .srv-title { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 14px; }
+  .servo-row .srv-data { font-family: var(--mono); font-size: 13px; line-height: 1.55; color: var(--text-secondary); word-break: break-all; }
+  .servo-row .srv-data.bad { color: var(--destructive); font-weight: 600; }
+  .online-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; flex: none; background: #C7C7CC; }
+  .online-dot.on { background: var(--success); }
+
+  /* controls card internals */
+  .btn-row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
+  .btn-row:last-child { margin-bottom: 0; }
+  .btn-row button { min-height: 42px; font-size: 15px; padding: 9px 20px; }
+  #btn-stop { padding: 12px 26px; font-size: 16px; font-weight: 600; }
+
+  .field-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 0;
+    border-top: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  .field-row .field-label { font-size: 14px; color: var(--text-secondary); width: 64px; flex: none; }
+  .field-row input[type="range"] { flex: 1; min-width: 120px; accent-color: var(--accent); height: 30px; cursor: pointer; }
+  .field-value { font-family: var(--mono); font-size: 14px; min-width: 46px; text-align: right; }
+  .field-row input[type="number"] { width: 100px; min-height: 38px; padding: 7px 12px; font-size: 14px; }
+  .field-row button { font-size: 14px; padding: 8px 16px; min-height: 38px; }
+
+  /* touch pad: clusters, enlarged */
+  .pad-wrap { display: flex; gap: 28px; align-items: center; justify-content: center; }
+  .pad-cluster { display: grid; grid-template-columns: repeat(3, 74px); grid-auto-rows: 62px; gap: 8px; touch-action: none; user-select: none; -webkit-user-select: none; }
+  .pad-btn {
+    background: var(--card-solid);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    font-size: 21px;
+    font-weight: 600;
+    color: var(--accent);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+    min-height: 62px;
+    padding: 0;
+    line-height: 1.1;
+  }
+  .pad-btn small { display: block; font-size: 10px; font-weight: 500; color: var(--text-secondary); }
+  .pad-btn.held { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .pad-btn.held small { color: rgba(255,255,255,0.8); }
+  .pad-group-label { font-size: 12px; color: var(--text-secondary); text-align: center; margin-bottom: 6px; }
+
+  /* onboard camera section inside the touch pad */
+  .pad-cams { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
+  .pad-cams .pad-group-label { margin-bottom: 10px; }
+  .cam-btn-row { display: flex; gap: 8px; }
+  .cam-btn {
+    flex: 1;
+    min-height: 46px;
+    font-size: 14px;
+    border-radius: 14px;
+    background: var(--card-solid);
+    border: 1px solid var(--border);
+    flex-direction: column;
+    gap: 2px;
+    padding: 6px 4px;
+  }
+  .cam-btn svg { color: var(--text-secondary); }
+  .cam-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .cam-btn.active svg { color: #fff; }
+
+  /* draggable camera floating windows (Tesla-style surround view) */
+  .cam-float {
+    position: fixed;
+    z-index: 28;
+    width: 304px;
+    height: 228px;
+    min-width: 240px;
+    min-height: 170px;
+    max-width: min(720px, 92vw);
+    max-height: 72vh;
+    display: flex;
+    flex-direction: column;
+    background: var(--card);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    box-shadow: var(--shadow-pop);
+    overflow: hidden;
+    resize: both; /* free resize from the bottom-right corner */
+    animation: cam-in 200ms ease-out;
+  }
+  @keyframes cam-in { from { opacity: 0; transform: scale(0.96); } to { opacity: 1; transform: none; } }
+  .cam-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 8px 8px 14px;
+    cursor: grab;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: none;
+  }
+  .cam-head:active { cursor: grabbing; }
+  .cam-title { font-size: 13px; font-weight: 600; }
+  .cam-live {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    color: var(--destructive);
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .cam-live::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--destructive); }
+  .cam-close { margin-left: auto; padding: 4px; min-height: 28px; min-width: 28px; border-radius: 50%; font-size: 12px; }
+  /* canvas fills whatever size the window is dragged to; gradient stands in
+     for the sky where the scene has no geometry */
+  .cam-head { flex: none; }
+  .cam-float canvas {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: block;
+    width: 100%;
+    background: linear-gradient(180deg, #D9DBE3 0%, #ECECF1 55%, #E4E4EA 100%);
+  }
+  [data-theme="dark"] .cam-float canvas {
+    background: linear-gradient(180deg, #141416 0%, #0B0B0D 55%, #101012 100%);
+  }
+
+  /* ---- chart floating window (top-left, toggled) ---- */
+  #chart-float {
+    position: fixed;
+    top: 66px;
+    left: 14px;
+    z-index: 30;
+    width: min(540px, calc(100vw - 28px));
+    background: var(--card);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-pop);
+    padding: 16px 18px;
+    opacity: 0;
+    transform: translateY(-8px) scale(0.98);
+    pointer-events: none;
+    transition: opacity 200ms, transform 200ms;
+  }
+  #chart-float.open { opacity: 1; transform: none; pointer-events: auto; }
+  /* chart float covers the left panel's top: slide the panel below it while open */
+  @media (min-width: 981px) {
+    .hud-left { transition: top 200ms; }
+    body:has(#chart-float.open) .hud-left {
+      top: 470px;
+      max-height: calc(100vh - 560px);
+    }
+  }
+  #telemetry-chart { width: 100%; height: 270px; display: block; }
+  .chart-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .chip { border-radius: var(--radius-pill); padding: 6px 14px; font-size: 13px; background: var(--control-bg); min-height: 32px; }
+  .chip.active { background: var(--accent); color: #fff; }
+  .chart-legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 10px; font-size: 13px; color: var(--text-secondary); }
+  .chart-legend .swatch { display: inline-block; width: 16px; height: 0; border-top: 3px solid; margin-right: 5px; vertical-align: middle; }
+  .chart-legend .swatch.dashed { border-top-style: dashed; }
+  .chart-legend .swatch.dotted { border-top-style: dotted; }
+  .chart-legend .cur { font-family: var(--mono); color: var(--text); margin-left: 4px; }
+
+  .icon-btn { padding: 8px; border-radius: 50%; }
+  .icon-btn svg { display: block; }
+  [data-theme="dark"] .sun-icon { display: block; }
+  [data-theme="dark"] .moon-icon { display: none; }
+  .sun-icon { display: none; }
+  .moon-icon { display: block; }
+
+  .panel-help {
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.9;
+  }
+  kbd {
+    font-family: var(--mono);
+    font-size: 11px;
+    background: var(--card-solid);
+    border: 1px solid var(--border);
+    border-bottom-width: 2px;
+    border-radius: 6px;
+    padding: 1px 6px;
+  }
+  button kbd { background: rgba(255, 255, 255, 0.25); border: none; color: inherit; font-size: 10px; padding: 1px 5px; }
+  button.ghost kbd, button:not(.primary):not(.danger) kbd { background: rgba(0, 0, 0, 0.06); color: var(--text-secondary); }
+
+  /* ---- modal (Apple-style confirm sheet) ---- */
+  .modal-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0, 0, 0, 0.3);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 200;
+    opacity: 0; pointer-events: none;
+    transition: opacity 200ms;
+  }
+  .modal-backdrop.open { opacity: 1; pointer-events: auto; }
+  .modal {
+    background: var(--card-solid);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-pop);
+    width: min(400px, calc(100vw - 40px));
+    padding: 24px;
+    transform: scale(0.95);
+    transition: transform 200ms;
+  }
+  .modal-backdrop.open .modal { transform: scale(1); }
+  .modal h3 { font-size: 17px; font-weight: 600; margin-bottom: 8px; text-align: center; }
+  .modal p { font-size: 14px; color: var(--text-secondary); text-align: center; margin-bottom: 20px; }
+  .modal .modal-actions { display: flex; gap: 10px; }
+  .modal .modal-actions button { flex: 1; min-height: 44px; }
+
+  /* ---- toast ---- */
+  #toasts {
+    position: fixed; top: 64px; left: 50%; transform: translateX(-50%);
+    z-index: 300; display: flex; flex-direction: column; gap: 8px; align-items: center;
+    pointer-events: none;
+  }
+  .toast {
+    background: rgba(29, 29, 31, 0.92);
+    color: #fff; font-size: 14px;
+    padding: 10px 20px;
+    border-radius: var(--radius-pill);
+    box-shadow: var(--shadow-pop);
+    animation: toast-in 250ms ease-out;
+    max-width: min(480px, calc(100vw - 40px));
+  }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { transition: none !important; animation: none !important; }
+  }
+
+  /* ---- narrow screens: fall back to stacked scroll layout ---- */
+  @media (max-width: 980px) {
+    body { overflow: auto; display: flex; flex-direction: column; }
+    header { position: sticky; top: 0; order: -1; }
+    #robot-3d { position: relative; inset: auto; height: 44vh; min-height: 300px; }
+    .viz-hint { display: none; }
+    .hud-panel { position: static; width: auto; max-height: none; margin: 10px 12px; transform: none; }
+    .hud-statusbar { position: static; }
+    #chart-float { top: auto; bottom: 12px; left: 12px; right: 12px; width: auto; }
+  }
+  @media (max-width: 560px) {
+    .header-inner { row-gap: 10px; }
+    .logo { font-size: 15px; }
+    #port-select { order: 10; flex: 1 1 100%; min-width: 0; }
+    #btn-refresh { order: 11; }
+    #btn-connect { order: 12; flex: 1; }
+    .field-row button { flex: 1 1 100%; }
+  }
+</style>
+</head>
+<body>
+
+<!-- full-screen 3D stage -->
+<div id="robot-3d">
+  <div class="viz-hint">WASD 移动 · Q/E 转向 · R/F 升降 · 拖动旋转 · 滚轮缩放（虚拟演示）</div>
+</div>
+
+<header>
+  <div class="header-inner">
+    <div class="logo">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="4"/><circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2"/></svg>
+      RA8P1 全向底盘控制器
+    </div>
+    <div class="header-spacer"></div>
+    <button class="ghost icon-btn" id="btn-chart-toggle" aria-label="显示/隐藏实时曲线" title="实时曲线">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M6 15l4-6 4 3 5-8"/></svg>
+    </button>
+    <button class="ghost icon-btn" id="btn-theme" aria-label="切换深色模式" title="切换深色/浅色">
+      <svg class="moon-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      <svg class="sun-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+    </button>
+    <span class="conn-dot" id="conn-dot"></span>
+    <span class="conn-text" id="conn-text">未连接</span>
+    <select id="port-select" aria-label="LoRa 串口"></select>
+    <button class="ghost icon-btn" id="btn-refresh" title="刷新串口列表" aria-label="刷新串口列表">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+    </button>
+    <button class="primary" id="btn-connect">连接</button>
+  </div>
+</header>
+
+<!-- left: control & calibration -->
+<section class="hud-panel hud-left" aria-label="控制与标定">
+  <h2>控制与标定</h2>
+  <div class="btn-row">
+    <button class="primary" id="btn-arm" disabled>使能 <kbd>Enter</kbd></button>
+    <button class="danger" id="btn-stop">立即停用 <kbd>Space</kbd></button>
+  </div>
+  <div class="btn-row">
+    <button id="btn-clear-fault">清除故障</button>
+    <button id="btn-home">回零…</button>
+    <button id="btn-calibrate">开始上限标定…</button>
+  </div>
+  <div class="field-row">
+    <span class="field-label">速度比例</span>
+    <input type="range" id="speed-slider" min="5" max="100" step="1" value="20" aria-label="速度比例">
+    <span class="field-value" id="speed-value">20%</span>
+  </div>
+  <div class="field-row">
+    <span class="field-label">手柄死区</span>
+    <input type="number" id="deadzone-input" min="0" max="0.8" step="0.01" value="0.12" aria-label="手柄死区">
+  </div>
+  <div class="field-row">
+    <span class="field-label">软上限</span>
+    <input type="number" id="upper-input" min="0" max="99999999" step="1" value="0" aria-label="软上限计数">
+    <button id="btn-send-upper">发送软上限</button>
+    <button id="btn-capture-upper">捕获当前为软上限</button>
+  </div>
+  <p class="panel-help">
+    <kbd>W</kbd><kbd>S</kbd> 前后 · <kbd>A</kbd><kbd>D</kbd> 左右 · <kbd>Q</kbd><kbd>E</kbd> 旋转 · <kbd>R</kbd><kbd>F</kbd> 升降 ·
+    <kbd>Enter</kbd> 切换使能 · <kbd>Space</kbd> 立即停用<br>
+    窗口失焦、手柄断开、串口关闭或页面离开时自动发送零速停用。
+  </p>
+</section>
+
+<!-- right: enlarged touch pad -->
+<section class="hud-panel hud-pad" aria-label="触屏按键">
+  <h2>触屏按键（按住生效）</h2>
+  <div class="pad-wrap">
+    <div>
+      <div class="pad-group-label">平移</div>
+      <div class="pad-cluster">
+        <span></span>
+        <button class="pad-btn" data-key="w">↑<small>W 前</small></button>
+        <span></span>
+        <button class="pad-btn" data-key="a">←<small>A 左</small></button>
+        <button class="pad-btn" data-key="s">↓<small>S 后</small></button>
+        <button class="pad-btn" data-key="d">→<small>D 右</small></button>
+      </div>
+    </div>
+    <div>
+      <div class="pad-group-label">旋转 / 升降</div>
+      <div class="pad-cluster">
+        <button class="pad-btn" data-key="q">⟲<small>Q 左旋</small></button>
+        <button class="pad-btn" data-key="r">▲<small>R 上升</small></button>
+        <span></span>
+        <button class="pad-btn" data-key="e">⟳<small>E 右旋</small></button>
+        <button class="pad-btn" data-key="f">▼<small>F 下降</small></button>
+        <span></span>
+      </div>
+    </div>
+  </div>
+  <div class="pad-cams">
+    <div class="pad-group-label">摄像头视角（模拟）</div>
+    <div class="cam-btn-row">
+      <button class="cam-btn" data-cam="wrist_l" aria-pressed="false">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+        左腕
+      </button>
+      <button class="cam-btn" data-cam="chest" aria-pressed="false">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+        胸口
+      </button>
+      <button class="cam-btn" data-cam="wrist_r" aria-pressed="false">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+        右腕
+      </button>
+    </div>
+  </div>
+</section>
+
+<!-- bottom: full-width status bar -->
+<section class="hud-panel hud-statusbar" aria-label="整机状态与舵机遥测">
+  <div class="sb-cell">
+    <span class="sb-k">状态</span>
+    <span class="sb-v"><span class="state-pill st-idle" id="state-pill"><span class="dot"></span><span id="state-text">等待遥测</span></span></span>
+  </div>
+  <div class="sb-cell">
+    <span class="sb-k">故障</span>
+    <span class="sb-v" id="fault-text">无</span>
+  </div>
+  <div class="sb-cell">
+    <span class="sb-k">触发快照</span>
+    <span class="sb-v" id="snapshot-text">无</span>
+  </div>
+  <div class="sb-cell">
+    <span class="sb-k">链路</span>
+    <span class="sb-v mono" id="link-text">--</span>
+  </div>
+  <div class="sb-cell sb-lift">
+    <span class="sb-k">升降</span>
+    <span class="sb-v mono" id="lift-text">--</span>
+  </div>
+  <div class="sb-sep"></div>
+  <div class="sb-servos" id="servo-list">
+    <div class="servo-row"><span class="srv-title"><span class="online-dot"></span><span class="srv-name">ID1</span></span><span class="srv-data">--</span></div>
+    <div class="servo-row"><span class="srv-title"><span class="online-dot"></span><span class="srv-name">ID2</span></span><span class="srv-data">--</span></div>
+    <div class="servo-row"><span class="srv-title"><span class="online-dot"></span><span class="srv-name">ID3</span></span><span class="srv-data">--</span></div>
+    <div class="servo-row"><span class="srv-title"><span class="online-dot"></span><span class="srv-name">ID4 升降</span></span><span class="srv-data">--</span></div>
+  </div>
+</section>
+
+<!-- chart floating window (hidden by default) -->
+<section id="chart-float" aria-label="实时曲线">
+  <div class="chart-toolbar" role="tablist" aria-label="曲线指标">
+    <button class="chip active" data-metric="lift" role="tab">升降位置</button>
+    <button class="chip" data-metric="wheel" role="tab">轮速</button>
+    <button class="chip" data-metric="temp" role="tab">温度</button>
+    <div class="header-spacer"></div>
+    <button class="chip" id="btn-chart-pause" aria-label="暂停曲线">暂停</button>
+    <button class="chip" id="btn-chart-close" aria-label="关闭曲线">✕</button>
+  </div>
+  <canvas id="telemetry-chart" aria-label="遥测实时曲线"></canvas>
+  <div class="chart-legend" id="chart-legend"></div>
+</section>
+
+<div class="modal-backdrop" id="modal-backdrop" role="dialog" aria-modal="true">
+  <div class="modal">
+    <h3 id="modal-title"></h3>
+    <p id="modal-body"></p>
+    <div class="modal-actions">
+      <button id="modal-cancel">取消</button>
+      <button class="danger" id="modal-confirm">确认</button>
+    </div>
+  </div>
+</div>
+
+<div id="toasts" aria-live="polite"></div>
+
+<script>
+"use strict";
+
+/* ================= WebSocket ================= */
+let ws = null;
+let wsOpen = false;
+let config = { speed_scale: 0.2, gamepad_deadzone: 0.12, gamepad_axes: {left_x:0,left_y:1,right_x:2}, gamepad_buttons: {left_shoulder:4,right_shoulder:5,start:7,stop:1}, upper_limit_counts: 0 };
+let telemetry = null;
+let lastTelemetryAt = 0;
+let telemetryStaleNotified = false;
+let connected = false;
+let sequenceSynced = false;
+
+function wsUrl() {
+  return (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
+}
+
+function send(obj) {
+  if (wsOpen && ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(obj));
+    return true;
+  }
+  return false;
+}
+
+function connectWs() {
+  ws = new WebSocket(wsUrl());
+  ws.onopen = () => {
+    wsOpen = true;
+    send({ type: "list_ports" });
+  };
+  ws.onclose = () => {
+    wsOpen = false;
+    setConnUi(false, "服务器断开，重连中…");
+    setTimeout(connectWs, 1000);
+  };
+  ws.onerror = () => ws.close();
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    handleMessage(msg);
+  };
+}
+
+function handleMessage(msg) {
+  switch (msg.type) {
+    case "config":
+      config = Object.assign(config, msg.config || {});
+      applyConfigToUi();
+      break;
+    case "ports":
+      fillPorts(msg.ports || []);
+      break;
+    case "connection":
+      connected = !!msg.connected;
+      sequenceSynced = !!msg.sequence_synced;
+      setConnUi(connected, msg.text || "");
+      if (!connected) { telemetry = null; resetStatusUi(); }
+      break;
+    case "telemetry":
+      telemetry = msg.t;
+      lastTelemetryAt = performance.now();
+      telemetryStaleNotified = false;
+      chartPush(telemetry);
+      renderTelemetry();
+      break;
+    case "serial_error":
+      toast("串口错误：" + msg.message);
+      break;
+    case "error":
+      toast(msg.message || "操作失败");
+      break;
+  }
+}
+
+/* ================= UI helpers ================= */
+const $ = (id) => document.getElementById(id);
+
+function setConnUi(isConnected, text) {
+  $("conn-dot").className = "conn-dot" + (isConnected ? (telemetry ? " on" : " warn") : "");
+  $("conn-text").textContent = text;
+  $("btn-connect").textContent = isConnected ? "断开" : "连接";
+  $("btn-connect").className = isConnected ? "ghost" : "primary";
+  updateButtonStates();
+}
+
+function toast(text) {
+  const el = document.createElement("div");
+  el.className = "toast";
+  el.textContent = text;
+  $("toasts").appendChild(el);
+  setTimeout(() => { el.style.opacity = "0"; el.style.transition = "opacity 300ms"; }, 2600);
+  setTimeout(() => el.remove(), 3000);
+}
+
+function confirmSheet(title, body, confirmText) {
+  return new Promise((resolve) => {
+    const backdrop = $("modal-backdrop");
+    $("modal-title").textContent = title;
+    $("modal-body").textContent = body;
+    $("modal-confirm").textContent = confirmText || "确认";
+    backdrop.classList.add("open");
+    $("modal-confirm").focus();
+    const done = (ok) => {
+      backdrop.classList.remove("open");
+      $("modal-confirm").onclick = $("modal-cancel").onclick = backdrop.onclick = null;
+      document.removeEventListener("keydown", onKey);
+      resolve(ok);
+    };
+    const onKey = (e) => { if (e.key === "Escape") done(false); };
+    $("modal-confirm").onclick = () => done(true);
+    $("modal-cancel").onclick = () => done(false);
+    backdrop.onclick = (e) => { if (e.target === backdrop) done(false); };
+    document.addEventListener("keydown", onKey);
+  });
+}
+
+function fillPorts(ports) {
+  const sel = $("port-select");
+  const current = sel.value || config.com_port || "";
+  sel.innerHTML = "";
+  const usable = ports.filter((p) => !p.is_jlink);
+  for (const p of usable) {
+    const opt = document.createElement("option");
+    opt.value = p.device;
+    opt.textContent = p.description ? `${p.device} — ${p.description}` : p.device;
+    sel.appendChild(opt);
+  }
+  if (usable.length === 0) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "未发现串口";
+    sel.appendChild(opt);
+  }
+  sel.value = usable.some((p) => p.device === current) ? current : (usable[0] ? usable[0].device : "");
+}
+
+function applyConfigToUi() {
+  $("speed-slider").value = Math.round((config.speed_scale || 0.2) * 100);
+  $("speed-value").textContent = $("speed-slider").value + "%";
+  $("deadzone-input").value = config.gamepad_deadzone ?? 0.12;
+  $("upper-input").value = config.upper_limit_counts ?? 0;
+}
+
+const SERVO_NAMES = ["ID1", "ID2", "ID3", "ID4 升降"];
+
+function resetStatusUi() {
+  $("state-text").textContent = "等待遥测";
+  $("state-pill").className = "state-pill st-idle";
+  $("fault-text").textContent = "无";
+  $("fault-text").style.color = "";
+  $("snapshot-text").textContent = "无";
+  $("link-text").textContent = "--";
+  $("lift-text").textContent = "--";
+  document.querySelectorAll("#servo-list .servo-row").forEach((row, i) => {
+    row.querySelector(".online-dot").className = "online-dot";
+    row.querySelector(".srv-name").textContent = SERVO_NAMES[i];
+    const data = row.querySelector(".srv-data");
+    data.classList.remove("bad");
+    data.textContent = "--";
+  });
+  updateButtonStates();
+}
+
+/* ================= telemetry rendering ================= */
+const STATE_CLASSES = { 0: "st-idle", 1: "st-busy", 2: "st-idle", 3: "st-active", 4: "st-fault", 5: "st-busy", 6: "st-warn" };
+
+function renderTelemetry() {
+  const stale = performance.now() - lastTelemetryAt > 1000;
+  if (!telemetry || (connected && stale)) {
+    if (connected && stale) {
+      $("state-text").textContent = "遥测失联";
+      $("state-pill").className = "state-pill st-warn";
+      $("conn-dot").className = "conn-dot warn";
+      $("conn-text").textContent = "已连接，遥测超过 1 秒未更新";
+      if (!telemetryStaleNotified) {
+        telemetryStaleNotified = true;
+        send({ type: "safe_stop" });
+      }
+      updateButtonStates();
+      return;
+    }
+  }
+  if (!telemetry) return;
+
+  const t = telemetry;
+  $("state-text").textContent = t.state_name;
+  $("state-pill").className = "state-pill " + (STATE_CLASSES[t.state] || "st-idle");
+  $("fault-text").textContent = t.fault_text;
+  $("fault-text").style.color = t.fault_bits ? "var(--destructive)" : "";
+  $("snapshot-text").textContent = t.fault_snapshot.fault_text;
+  $("link-text").textContent = `${t.link_age_ms} ms，帧序号 ${t.last_control_sequence}`;
+  $("lift-text").textContent =
+    `位置 ${t.lift_position} / 目标 ${t.lift_target} / 上限 ${t.upper_limit}，` +
+    `回零=${t.homed ? "是" : "否"}，原点=${t.home_switch ? "触发" : "正常"}`;
+  if (connected) {
+    $("conn-dot").className = "conn-dot on";
+    $("conn-text").textContent = "已连接，收到遥测";
+  }
+
+  const rows = document.querySelectorAll("#servo-list .servo-row");
+  t.servos.forEach((s, i) => {
+    const row = rows[i];
+    row.querySelector(".online-dot").className = "online-dot" + (s.online ? " on" : "");
+    row.querySelector(".srv-name").textContent = SERVO_NAMES[i] + (s.online ? "" : " 掉线");
+    const bad = s.protocol_error || s.status_flags || s.temperature_c >= 70;
+    const data = row.querySelector(".srv-data");
+    data.classList.toggle("bad", !!bad);
+    const limit = s.temperature_limit_c != null ? s.temperature_limit_c : "--";
+    data.textContent =
+      `${s.voltage_v.toFixed(1)}V ${s.temperature_c}/${limit}°C 位${s.position} 速${s.speed} 流${s.current} ${s.fault_text}`;
+  });
+  updateButtonStates();
+}
+
+function updateButtonStates() {
+  const t = telemetry;
+  const stale = performance.now() - lastTelemetryAt > 1000;
+  const ready = connected && t && !stale;
+  const active = t && (t.state === 1 || t.state === 3 || t.state === 5 || t.state === 6);
+  $("btn-arm").disabled = !ready;
+  $("btn-arm").innerHTML = (active ? "停用" : "使能") + " <kbd>Enter</kbd>";
+  $("btn-arm").className = active ? "danger" : "primary";
+  $("btn-calibrate").disabled = !(ready && t.state === 2 && t.homed && !t.fault_bits && !t.upper_limit);
+  $("btn-capture-upper").disabled = !(ready && t.state === 5 && t.homed && t.lift_position > 0);
+  // CONFIG 只允许在停用相关状态发送（固件在 ARMED/HOMING 会忽略）
+  $("btn-send-upper").disabled = !(ready && (t.state === 0 || t.state === 2 || t.state === 4 || t.state === 5));
+}
+
+/* ================= input: keyboard + pad + gamepad ================= */
+const keys = new Set();
+const MOTION_KEYS = new Set(["w", "a", "s", "d", "q", "e", "r", "f"]);
+
+function isTyping() {
+  const el = document.activeElement;
+  return el && (el.tagName === "INPUT" || el.tagName === "SELECT" || el.tagName === "TEXTAREA");
+}
+
+document.addEventListener("keydown", (e) => {
+  if (isTyping()) return;
+  const key = e.key.toLowerCase();
+  if (key === "enter") {
+    if (!e.repeat) toggleArm();
+    e.preventDefault();
+  } else if (key === " ") {
+    if (!e.repeat) stopNow();
+    e.preventDefault();
+  } else if (MOTION_KEYS.has(key)) {
+    keys.add(key);
+    e.preventDefault();
+  }
+});
+document.addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
+
+document.querySelectorAll(".pad-btn").forEach((btn) => {
+  const key = btn.dataset.key;
+  const press = (e) => { e.preventDefault(); keys.add(key); btn.classList.add("held"); };
+  const release = () => { keys.delete(key); btn.classList.remove("held"); };
+  btn.addEventListener("pointerdown", press);
+  btn.addEventListener("pointerup", release);
+  btn.addEventListener("pointercancel", release);
+  btn.addEventListener("pointerleave", release);
+  btn.addEventListener("contextmenu", (e) => e.preventDefault());
+});
+
+/* gamepad (browser Gamepad API, mapping from shared config) */
+let gamepadPrev = {};
+let hadGamepad = false;
+function deadzone(v, zone) {
+  if (Math.abs(v) <= zone) return 0;
+  return ((Math.abs(v) - zone) / (1 - zone)) * (v > 0 ? 1 : -1);
+}
+function pollGamepad() {
+  const out = { vx: 0, vy: 0, omega: 0, lift: 0 };
+  const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+  const gp = pads && Array.from(pads).find((p) => p && p.connected);
+  if (!gp) {
+    if (hadGamepad) { hadGamepad = false; gamepadPrev = {}; stopNow(); }
+    return out;
+  }
+  hadGamepad = true;
+  const axes = config.gamepad_axes, buttons = config.gamepad_buttons;
+  const zone = Math.max(0, Math.min(0.8, parseFloat(config.gamepad_deadzone) || 0.12));
+  try {
+    out.vy = -deadzone(gp.axes[axes.left_x] || 0, zone);
+    out.vx = -deadzone(gp.axes[axes.left_y] || 0, zone);
+    out.omega = -deadzone(gp.axes[axes.right_x] || 0, zone);
+    out.lift = (gp.buttons[buttons.right_shoulder]?.pressed ? 1 : 0) - (gp.buttons[buttons.left_shoulder]?.pressed ? 1 : 0);
+    for (const [name, fn] of [["start", toggleArm], ["stop", stopNow]]) {
+      const n = buttons[name];
+      const pressed = !!gp.buttons[n]?.pressed;
+      if (pressed && !gamepadPrev[n]) fn();
+      gamepadPrev[n] = pressed;
+    }
+  } catch { /* ignore malformed pads */ }
+  return out;
+}
+
+/* motion compose + 50 ms heartbeat (keeps the backend watchdog fed) */
+function currentMotion() {
+  const g = pollGamepad();
+  const clamp = (v) => Math.max(-1, Math.min(1, v));
+  return {
+    vx: clamp((keys.has("w") ? 1 : 0) - (keys.has("s") ? 1 : 0) + g.vx),
+    vy: clamp((keys.has("a") ? 1 : 0) - (keys.has("d") ? 1 : 0) + g.vy),
+    omega: clamp((keys.has("q") ? 1 : 0) - (keys.has("e") ? 1 : 0) + g.omega),
+    lift: clamp((keys.has("r") ? 1 : 0) - (keys.has("f") ? 1 : 0) + g.lift),
+  };
+}
+setInterval(() => {
+  const m = document.hidden ? { vx: 0, vy: 0, omega: 0, lift: 0 } : currentMotion();
+  latestMotion = m;
+  send(Object.assign({ type: "motion" }, m));
+}, 50);
+
+/* telemetry staleness check */
+setInterval(() => {
+  if (connected && telemetry && performance.now() - lastTelemetryAt > 1000) renderTelemetry();
+}, 500);
+
+/* ================= actions ================= */
+function toggleArm() {
+  if (!$("btn-arm").disabled) send({ type: "action", name: "arm_toggle" });
+}
+function stopNow() {
+  keys.clear();
+  document.querySelectorAll(".pad-btn.held").forEach((b) => b.classList.remove("held"));
+  send({ type: "action", name: "stop" });
+}
+
+$("btn-arm").onclick = toggleArm;
+$("btn-stop").onclick = stopNow;
+$("btn-clear-fault").onclick = () => send({ type: "action", name: "clear_fault" });
+$("btn-home").onclick = async () => {
+  if (await confirmSheet("确认回零", "确认底盘已架空、升降下方无人和障碍物，并开始向下回零？", "开始回零")) {
+    send({ type: "action", name: "home" });
+  }
+};
+$("btn-calibrate").onclick = async () => {
+  if (await confirmSheet("确认上限标定", "标定期间底盘保持停用，只允许按 R 低速上升。请确认升降空载、上方无人且随时准备按 Space 停止。", "开始标定")) {
+    send({ type: "action", name: "calibrate" });
+  }
+};
+$("btn-capture-upper").onclick = async () => {
+  const pos = telemetry ? telemetry.lift_position : 0;
+  if (await confirmSheet("确认软上限", `将当前位置 ${pos} 保存为软上限？`, "保存")) {
+    send({ type: "capture_upper_limit" });
+  }
+};
+$("btn-send-upper").onclick = () => {
+  const value = parseInt($("upper-input").value, 10);
+  send({ type: "send_upper_limit", value: Number.isFinite(value) ? value : 0 });
+};
+
+$("btn-connect").onclick = () => {
+  if (connected) {
+    send({ type: "disconnect" });
+  } else {
+    const port = $("port-select").value;
+    if (!port) { toast("请连接电脑端 LoRa/USB-TTL，点击刷新并选择新出现的 COM 口"); return; }
+    send({ type: "connect", port });
+  }
+};
+$("btn-refresh").onclick = () => send({ type: "list_ports" });
+
+let configSaveTimer = null;
+$("speed-slider").addEventListener("input", () => {
+  $("speed-value").textContent = $("speed-slider").value + "%";
+  clearTimeout(configSaveTimer);
+  configSaveTimer = setTimeout(() => {
+    send({ type: "set_config", speed_scale: parseInt($("speed-slider").value, 10) / 100 });
+  }, 300);
+});
+$("deadzone-input").addEventListener("change", () => {
+  const v = parseFloat($("deadzone-input").value);
+  if (Number.isFinite(v)) send({ type: "set_config", gamepad_deadzone: Math.max(0, Math.min(0.8, v)) });
+});
+
+/* ================= safety: page lifecycle ================= */
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { keys.clear(); send({ type: "safe_stop" }); }
+});
+window.addEventListener("blur", () => { keys.clear(); send({ type: "safe_stop" }); });
+window.addEventListener("pagehide", () => send({ type: "safe_stop" }));
+window.addEventListener("beforeunload", () => send({ type: "safe_stop" }));
+
+/* ================= dark mode ================= */
+const themeListeners = [];
+$("btn-theme").onclick = () => {
+  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  localStorage.setItem("ra8p1-theme", next);
+  themeListeners.forEach((cb) => cb(next));
+};
+
+/* ================= streaming telemetry chart =================
+   Per ui-ux-pro-max chart guidance: canvas for real-time data, 60 s buffer,
+   distinct colors AND line styles (not hue alone), pause/resume control. */
+const CHART_METRICS = {
+  lift: [
+    { name: "位置", color: "#0A84FF", dash: [], get: (t) => t.lift_position },
+    { name: "目标", color: "#8E8E93", dash: [6, 4], get: (t) => t.lift_target },
+  ],
+  wheel: [
+    { name: "ID1 前轮", color: "#0A84FF", dash: [], get: (t) => t.wheel_speed[0] },
+    { name: "ID2 左后", color: "#FF9F0A", dash: [6, 4], get: (t) => t.wheel_speed[1] },
+    { name: "ID3 右后", color: "#BF5AF2", dash: [2, 3], get: (t) => t.wheel_speed[2] },
+  ],
+  temp: [
+    { name: "ID1", color: "#0A84FF", dash: [], get: (t) => t.servos[0].temperature_c },
+    { name: "ID2", color: "#30D158", dash: [6, 4], get: (t) => t.servos[1].temperature_c },
+    { name: "ID3", color: "#FF9F0A", dash: [2, 3], get: (t) => t.servos[2].temperature_c },
+    { name: "ID4", color: "#FF453A", dash: [8, 3, 2, 3], get: (t) => t.servos[3].temperature_c },
+  ],
+};
+const CHART_MAX_SAMPLES = 300; // 60 s at 5 Hz
+const chartState = { metric: "lift", paused: false, samples: [] };
+
+function chartPush(tel) {
+  if (chartState.paused) return;
+  chartState.samples.push({ at: performance.now(), tel });
+  if (chartState.samples.length > CHART_MAX_SAMPLES) chartState.samples.shift();
+}
+
+function chartDraw() {
+  const canvas = $("telemetry-chart");
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (!w || !h) return;
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const css = getComputedStyle(document.documentElement);
+  const colText = css.getPropertyValue("--text-secondary").trim();
+  const colBorder = css.getPropertyValue("--border").trim();
+
+  const padL = 48, padR = 10, padT = 10, padB = 22;
+  const plotW = w - padL - padR, plotH = h - padT - padB;
+  const series = CHART_METRICS[chartState.metric];
+  const samples = chartState.samples;
+
+  // y range across all series
+  let lo = Infinity, hi = -Infinity;
+  for (const s of samples) for (const def of series) {
+    const v = def.get(s.tel);
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+  if (!samples.length) { lo = 0; hi = 1; }
+  if (lo === hi) { lo -= 1; hi += 1; }
+  const span = hi - lo;
+  lo -= span * 0.1; hi += span * 0.1;
+
+  // grid + y labels
+  ctx.font = "10px " + css.getPropertyValue("--mono");
+  ctx.fillStyle = colText;
+  ctx.strokeStyle = colBorder;
+  ctx.lineWidth = 1;
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  for (let i = 0; i <= 4; i++) {
+    const y = padT + (plotH * i) / 4;
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(w - padR, y);
+    ctx.stroke();
+    ctx.fillText(Math.round(hi - ((hi - lo) * i) / 4), padL - 8, y);
+  }
+  // x labels: actual time span of buffered samples
+  const n = samples.length;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  if (n > 1) {
+    const spanS = Math.max(1, Math.round((samples[n - 1].at - samples[0].at) / 1000));
+    ctx.fillText("-" + spanS + "s", padL + 10, h - padB + 6);
+  }
+  ctx.fillText("现在", w - padR - 10, h - padB + 6);
+
+  // series polylines (stretched to fill the plot width with available samples)
+  for (const def of series) {
+    ctx.beginPath();
+    ctx.strokeStyle = def.color;
+    ctx.lineWidth = 1.8;
+    ctx.setLineDash(def.dash);
+    for (let i = 0; i < n; i++) {
+      const x = padL + (n > 1 ? (plotW * i) / (n - 1) : plotW / 2);
+      const v = def.get(samples[i].tel);
+      const y = padT + plotH * (1 - (v - lo) / (hi - lo));
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  // legend with current values (text, not color alone)
+  const legend = $("chart-legend");
+  const latest = n ? samples[n - 1].tel : null;
+  legend.innerHTML = series.map((def) => {
+    const style = def.dash.length >= 4 ? "dotted" : def.dash.length ? "dashed" : "";
+    const cur = latest ? def.get(latest) : "--";
+    return `<span><span class="swatch ${style}" style="border-top-color:${def.color}"></span>${def.name}<span class="cur">${cur}</span></span>`;
+  }).join("");
+}
+setInterval(chartDraw, 200);
+
+document.querySelectorAll(".chart-toolbar .chip[data-metric]").forEach((chip) => {
+  chip.onclick = () => {
+    document.querySelectorAll(".chart-toolbar .chip[data-metric]").forEach((c) => c.classList.remove("active"));
+    chip.classList.add("active");
+    chartState.metric = chip.dataset.metric;
+    chartDraw();
+  };
+});
+$("btn-chart-pause").onclick = () => {
+  chartState.paused = !chartState.paused;
+  $("btn-chart-pause").textContent = chartState.paused ? "继续" : "暂停";
+  $("btn-chart-pause").classList.toggle("active", chartState.paused);
+};
+$("btn-chart-toggle").onclick = () => {
+  $("chart-float").classList.toggle("open");
+  chartDraw(); // canvas may have been 0-sized while hidden
+};
+$("btn-chart-close").onclick = () => $("chart-float").classList.remove("open");
+
+/* ================= onboard camera floating windows =================
+   Simulated views rendered by robot3d.js from virtual cameras mounted on
+   the wrists and chest; swap in real streams here once cameras are wired. */
+const CAM_DEFS = {
+  wrist_l: "左腕摄像头",
+  chest: "胸口摄像头",
+  wrist_r: "右腕摄像头",
+};
+/* default slots: a flush row of three between the left panel and the pad */
+const CAM_SLOTS = {
+  wrist_l: [388, 84],
+  chest: [692, 84],
+  wrist_r: [996, 84],
+};
+const openCamEls = new Map();
+let camZ = 28;
+
+function toggleCam(id) {
+  if (openCamEls.has(id)) closeCam(id);
+  else openCam(id);
+}
+
+function openCam(id) {
+  if (openCamEls.has(id)) return;
+  if (!window.__robotCams) { toast("3D 场景尚未就绪，稍后再试"); return; }
+  const el = document.createElement("div");
+  el.className = "cam-float";
+  el.innerHTML =
+    `<div class="cam-head"><span class="cam-title">${CAM_DEFS[id]}</span>` +
+    `<span class="cam-live">SIM</span>` +
+    `<button class="cam-close" aria-label="关闭 ${CAM_DEFS[id]}">✕</button></div>` +
+    `<canvas></canvas>`;
+  // slot placement over the 3D stage; free drag afterwards
+  const slot = CAM_SLOTS[id] || [410, 92];
+  el.style.left = Math.max(8, Math.min(slot[0], window.innerWidth - 320)) + "px";
+  el.style.top = Math.max(56, Math.min(slot[1], window.innerHeight - 240)) + "px";
+  el.style.zIndex = ++camZ;
+  document.body.appendChild(el);
+  el.querySelector(".cam-close").onclick = () => closeCam(id);
+  el.addEventListener("pointerdown", () => { el.style.zIndex = ++camZ; });
+  makeDraggable(el, el.querySelector(".cam-head"));
+  openCamEls.set(id, el);
+  window.__robotCams.attach(id, el.querySelector("canvas"));
+  const btn = document.querySelector(`.cam-btn[data-cam="${id}"]`);
+  if (btn) { btn.classList.add("active"); btn.setAttribute("aria-pressed", "true"); }
+}
+
+function closeCam(id) {
+  const el = openCamEls.get(id);
+  if (!el) return;
+  if (window.__robotCams) window.__robotCams.detach(id);
+  el.remove();
+  openCamEls.delete(id);
+  const btn = document.querySelector(`.cam-btn[data-cam="${id}"]`);
+  if (btn) { btn.classList.remove("active"); btn.setAttribute("aria-pressed", "false"); }
+}
+
+function makeDraggable(el, handle) {
+  handle.addEventListener("pointerdown", (e) => {
+    if (e.target.closest("button")) return;
+    e.preventDefault();
+    const rect = el.getBoundingClientRect();
+    const dx = e.clientX - rect.left, dy = e.clientY - rect.top;
+    handle.setPointerCapture(e.pointerId);
+    const move = (ev) => {
+      const x = Math.max(0, Math.min(window.innerWidth - rect.width, ev.clientX - dx));
+      const y = Math.max(0, Math.min(window.innerHeight - rect.height, ev.clientY - dy));
+      el.style.left = x + "px";
+      el.style.top = y + "px";
+    };
+    const up = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", up);
+      handle.removeEventListener("pointercancel", up);
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", up);
+    handle.addEventListener("pointercancel", up);
+  });
+}
+
+document.querySelectorAll(".cam-btn").forEach((btn) => {
+  btn.onclick = () => toggleCam(btn.dataset.cam);
+});
+
+/* test hook: ?cam=chest,wrist_l opens the given camera windows on load */
+(function () {
+  const wanted = (new URLSearchParams(location.search).get("cam") || "")
+    .split(",").filter((id) => CAM_DEFS[id]);
+  if (!wanted.length) return;
+  const timer = setInterval(() => {
+    if (!window.__robotCams) return;
+    clearInterval(timer);
+    wanted.forEach(openCam);
+  }, 200);
+  setTimeout(() => clearInterval(timer), 10000);
+})();
+
+/* ================= bridge for the 3D module ================= */
+let latestMotion = { vx: 0, vy: 0, omega: 0, lift: 0 };
+window.__robotApp = {
+  getMotion: () => latestMotion,
+  getTelemetry: () =>
+    telemetry && performance.now() - lastTelemetryAt < 1000 && connected ? telemetry : null,
+  onThemeChange: (cb) => themeListeners.push(cb),
+  currentTheme: () => document.documentElement.dataset.theme,
+};
+
+connectWs();
+</script>
+<script type="module" src="/assets/robot3d.js"></script>
+</body>
+</html>
