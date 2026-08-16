@@ -19,13 +19,16 @@ FLAG_HOME = 1 << 2
 FLAG_CLEAR_FAULT = 1 << 3
 FLAG_CALIBRATE = 1 << 4
 
+# CONFIG, HOME and CALIBRATE remain encoded in protocol v3 for compatibility,
+# but the current firmware intentionally ignores them.
+
 STATE_NAMES = {
-    0: "未使能/未回零",
-    1: "回零中",
-    2: "未使能/已回零",
+    0: "未使能/零点无效",
+    1: "保留状态(1)",
+    2: "未使能/零点有效",
     3: "已使能",
     4: "故障",
-    5: "标定软上限",
+    5: "保留状态(5)",
     6: "自动恢复中",
 }
 
@@ -33,15 +36,15 @@ FAULT_NAMES = {
     1 << 0: "LoRa 控制超时",
     1 << 1: "舵机掉线",
     1 << 2: "舵机状态/过温",
-    1 << 3: "回零超时",
+    1 << 3: "保留故障(回零超时)",
     1 << 4: "驱动初始化失败",
-    1 << 5: "回零堵转/无位移",
+    1 << 5: "保留故障(回零堵转/无位移)",
 }
 
 SERVO_STATUS_NAMES = {
     1 << 0: "电压",
     1 << 1: "传感器",
-    1 << 2: "温度",
+    1 << 2: "温度状态(仅诊断)",
     1 << 3: "电流",
     1 << 4: "角度",
     1 << 5: "过载",
@@ -53,8 +56,8 @@ def _servo_fault_text(protocol_error: int, status_flags: int, temperature_c: int
     names = [name for bit, name in SERVO_STATUS_NAMES.items() if raw & bit]
     if raw & ~0x3F:
         names.append("未知状态")
-    if temperature_c >= 70 and "温度" not in names:
-        names.append("温度")
+    if temperature_c >= 70:
+        names.append("实测过温")
     if not names:
         return "状态正常"
     return f"异常:{'/'.join(names)} E=0x{protocol_error:02X} S=0x{status_flags:02X}"

@@ -1,8 +1,8 @@
 {
   "com_port": "COM3",
   "baud": 115200,
-  "upper_limit_counts": 0,
   "speed_scale": 0.2,
+  "lift_speed_scale": 0.6,
   "gamepad_deadzone": 0.12,
   "gamepad_axes": {
     "left_x": 0,

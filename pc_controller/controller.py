@@ -24,15 +24,12 @@ except ImportError:
 
 from protocol import (
     FLAG_ARM,
-    FLAG_CALIBRATE,
     FLAG_CLEAR_FAULT,
     FLAG_DISARM,
-    FLAG_HOME,
     MSG_TELEMETRY,
     FrameParser,
     Telemetry,
     decode_telemetry,
-    encode_config,
     encode_control,
 )
 
@@ -40,8 +37,8 @@ CONFIG_PATH = Path(__file__).with_name("controller_config.json")
 DEFAULT_CONFIG = {
     "com_port": "",
     "baud": 115200,
-    "upper_limit_counts": 0,
     "speed_scale": 0.20,
+    "lift_speed_scale": 0.60,
     "gamepad_deadzone": 0.12,
     "gamepad_axes": {"left_x": 0, "left_y": 1, "right_x": 2},
     "gamepad_buttons": {"left_shoulder": 4, "right_shoulder": 5, "start": 7, "stop": 1},
@@ -67,7 +64,6 @@ class RobotController:
         self.connected_at = 0.0
         self.sequence = 0
         self.sequence_synced = False
-        self.pending_config = False
         self.telemetry: Telemetry | None = None
         self.keys: set[str] = set()
         self.pending_flags = FLAG_DISARM
@@ -81,6 +77,7 @@ class RobotController:
 
         self.port_name = tk.StringVar(value=self.config["com_port"])
         self.speed_percent = tk.DoubleVar(value=float(self.config["speed_scale"]) * 100.0)
+        self.lift_speed_percent = tk.DoubleVar(value=float(self.config["lift_speed_scale"]) * 100.0)
         self.deadzone = tk.DoubleVar(value=float(self.config["gamepad_deadzone"]))
         self.connection_text = tk.StringVar(value="未连接")
         self.state_text = tk.StringVar(value="等待遥测")
@@ -88,7 +85,6 @@ class RobotController:
         self.link_text = tk.StringVar(value="--")
         self.lift_text = tk.StringVar(value="--")
         self.trigger_text = tk.StringVar(value="无")
-        self.upper_text = tk.StringVar(value=str(self.config["upper_limit_counts"]))
         self.servo_text = [tk.StringVar(value=f"ID{i + 1}: --") for i in range(4)]
 
         self._build_ui()
@@ -112,13 +108,14 @@ class RobotController:
     def _save_config(self) -> None:
         self.config["com_port"] = self.port_name.get()
         self.config["speed_scale"] = self.speed_percent.get() / 100.0
+        self.config["lift_speed_scale"] = self.lift_speed_percent.get() / 100.0
         self.config["gamepad_deadzone"] = self.deadzone.get()
         CONFIG_PATH.write_text(json.dumps(self.config, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _build_ui(self) -> None:
         self.root.title("RA8P1 全向底盘控制器")
-        self.root.geometry("720x565")
-        self.root.minsize(680, 525)
+        self.root.geometry("720x590")
+        self.root.minsize(680, 550)
         outer = ttk.Frame(self.root, padding=12)
         outer.pack(fill="both", expand=True)
 
@@ -145,30 +142,39 @@ class RobotController:
             ttk.Label(status, text=f"{name}：", width=8).grid(row=row, column=0, sticky="e")
             ttk.Label(status, textvariable=variable).grid(row=row, column=1, sticky="w")
 
-        controls = ttk.LabelFrame(outer, text="控制与标定", padding=8)
+        controls = ttk.LabelFrame(outer, text="控制", padding=8)
         controls.pack(fill="x", pady=(10, 0))
         ttk.Button(controls, text="切换使能 (Enter)", command=self.toggle_arm).grid(row=0, column=0, padx=4, pady=4)
         ttk.Button(controls, text="立即停用 (Space)", command=self.stop_now).grid(row=0, column=1, padx=4, pady=4)
         ttk.Button(controls, text="清除故障", command=lambda: self._pulse_flag(FLAG_CLEAR_FAULT)).grid(row=0, column=2, padx=4)
-        ttk.Button(controls, text="回零…", command=self.request_home).grid(row=0, column=3, padx=4)
-        ttk.Button(controls, text="捕获当前为软上限", command=self.capture_upper_limit).grid(row=0, column=4, padx=4)
-        ttk.Label(controls, text="速度比例").grid(row=1, column=0, sticky="e")
+        ttk.Label(controls, text="底盘速度").grid(row=1, column=0, sticky="e")
         ttk.Scale(controls, from_=5, to=100, variable=self.speed_percent, orient="horizontal", length=180).grid(
             row=1, column=1, columnspan=2, sticky="w"
         )
         ttk.Label(controls, text="手柄死区").grid(row=1, column=3, sticky="e")
         ttk.Entry(controls, textvariable=self.deadzone, width=7).grid(row=1, column=4, sticky="w")
-        ttk.Label(controls, text="软上限：").grid(row=2, column=0, sticky="e")
-        ttk.Label(controls, textvariable=self.upper_text).grid(row=2, column=1, sticky="w")
-        ttk.Button(controls, text="发送软上限", command=self.send_upper_limit).grid(row=2, column=2, padx=4)
-        ttk.Button(controls, text="开始上限标定…", command=self.request_calibration).grid(row=2, column=3, padx=4)
+        ttk.Label(controls, text="升降速度").grid(row=2, column=0, sticky="e")
+        tk.Scale(
+            controls,
+            from_=10,
+            to=100,
+            resolution=5,
+            variable=self.lift_speed_percent,
+            orient="horizontal",
+            length=180,
+            showvalue=True,
+            highlightthickness=0,
+        ).grid(row=2, column=1, columnspan=2, sticky="w")
 
         servos = ttk.LabelFrame(outer, text="STS3215 遥测", padding=8)
         servos.pack(fill="x", pady=(10, 0))
         for index, variable in enumerate(self.servo_text):
             ttk.Label(servos, textvariable=variable).grid(row=index, column=0, sticky="w")
 
-        help_text = "键盘：W/S 前后，A/D 左右，Q/E 旋转，R/F 升降。失焦、手柄断开、串口关闭时自动停用。"
+        help_text = (
+            "键盘：W/S 前后，A/D 左右，Q/E 旋转，R/F 升降。"
+            "升降无上端限位，每次上电前必须人工放到最低位；失焦、手柄断开、串口关闭时自动停用。"
+        )
         ttk.Label(outer, text=help_text, foreground="#555").pack(anchor="w", pady=(10, 0))
 
     def _bind_events(self) -> None:
@@ -236,7 +242,6 @@ class RobotController:
         self.connected_at = time.monotonic()
         self.telemetry = None
         self.sequence_synced = False
-        self.pending_config = True
         self.pending_flags |= FLAG_DISARM
         self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self.reader_thread.start()
@@ -298,45 +303,6 @@ class RobotController:
         for _ in range(count):
             self._write(encode_control(self._next_sequence(), 0, 0, 0, 0, FLAG_DISARM))
             time.sleep(0.05)
-
-    def send_upper_limit(self) -> None:
-        value = int(self.config.get("upper_limit_counts", 0))
-        self.upper_text.set(str(value))
-        if self.port is not None and self.port.is_open:
-            self.pending_config = True
-
-    def capture_upper_limit(self) -> None:
-        if self.telemetry is None or self.telemetry.state != 5 or not self.telemetry.homed:
-            messagebox.showwarning("不能捕获", "必须先完成回零并进入上限标定状态。")
-            return
-        if self.telemetry.lift_position <= 0:
-            messagebox.showwarning("不能捕获", "当前位置必须大于零。")
-            return
-        if not messagebox.askyesno("确认软上限", f"将当前位置 {self.telemetry.lift_position} 保存为软上限？"):
-            return
-        self.config["upper_limit_counts"] = self.telemetry.lift_position
-        self._save_config()
-        self.send_upper_limit()
-
-    def request_home(self) -> None:
-        if messagebox.askyesno("确认回零", "确认底盘已架空、升降下方无人和障碍物，并开始向下回零？"):
-            self._pulse_flag(FLAG_HOME)
-
-    def request_calibration(self) -> None:
-        if self.telemetry is None or self.telemetry.state != 2 or not self.telemetry.homed:
-            messagebox.showwarning("不能标定", "必须先完成回零，并保持整机未使能。")
-            return
-        if self.telemetry.fault_bits:
-            messagebox.showwarning("不能标定", "请先排除并清除故障。")
-            return
-        if self.telemetry.upper_limit > 0:
-            messagebox.showwarning("不能标定", "软上限已经有效；首版固件不允许在线覆盖标定。")
-            return
-        if messagebox.askyesno(
-            "确认上限标定",
-            "标定期间底盘保持停用，只允许按 R 低速上升。请确认升降空载、上方无人且随时准备按 Space 停止。",
-        ):
-            self._pulse_flag(FLAG_CALIBRATE)
 
     def toggle_arm(self) -> None:
         active = self.telemetry is not None and self.telemetry.state in (1, 3, 5, 6)
@@ -412,8 +378,14 @@ class RobotController:
         lift = float("r" in self.keys) - float("f" in self.keys)
         gx, gy, go, gl = self._gamepad_motion()
         vx, vy, omega, lift = (max(-1.0, min(1.0, a + b)) for a, b in ((vx, gx), (vy, gy), (omega, go), (lift, gl)))
-        scale = max(0.05, min(1.0, self.speed_percent.get() / 100.0))
-        return tuple(int(round(value * scale * 1000.0)) for value in (vx, vy, omega, lift))
+        chassis_scale = max(0.05, min(1.0, self.speed_percent.get() / 100.0))
+        lift_scale = max(0.10, min(1.0, self.lift_speed_percent.get() / 100.0))
+        return (
+            int(round(vx * chassis_scale * 1000.0)),
+            int(round(vy * chassis_scale * 1000.0)),
+            int(round(omega * chassis_scale * 1000.0)),
+            int(round(lift * lift_scale * 1000.0)),
+        )
 
     def _update_telemetry(self, telemetry: Telemetry) -> None:
         if not self.sequence_synced:
@@ -434,8 +406,8 @@ class RobotController:
         self.trigger_text.set(telemetry.fault_snapshot.fault_text)
         self.link_text.set(f"{telemetry.link_age_ms} ms，帧序号 {telemetry.last_control_sequence}")
         self.lift_text.set(
-            f"位置 {telemetry.lift_position} / 目标 {telemetry.lift_target} / 上限 {telemetry.upper_limit}，"
-            f"回零={'是' if telemetry.homed else '否'}，原点={'触发' if telemetry.home_switch else '正常'}"
+            f"位置 {telemetry.lift_position} / 目标 {telemetry.lift_target}，"
+            f"零点={'有效' if telemetry.homed else '无效'}，下限开关=未使用"
         )
         for index, servo in enumerate(telemetry.servos):
             temperature_limit = f"{servo.temperature_limit_c} °C" if servo.temperature_limit_c is not None else "--"
@@ -481,15 +453,10 @@ class RobotController:
             if self.telemetry is None and (time.monotonic() - self.connected_at) >= 1.0:
                 self.connection_text.set("已连接，但未收到遥测")
             if self.sequence_synced and self._control_slot_due(now):
-                if self.pending_config:
-                    value = int(self.config.get("upper_limit_counts", 0))
-                    if self._write(encode_config(self._next_sequence(), value)):
-                        self.pending_config = False
-                else:
-                    motion = self._motion() if self.window_active else (0, 0, 0, 0)
-                    flags = self.pending_flags
-                    if self._write(encode_control(self._next_sequence(), *motion, flags)):
-                        self.pending_flags = 0
+                motion = self._motion() if self.window_active else (0, 0, 0, 0)
+                flags = self.pending_flags
+                if self._write(encode_control(self._next_sequence(), *motion, flags)):
+                    self.pending_flags = 0
         self.root.after(UI_TICK_MS, self._tick)
 
     def close(self) -> None:

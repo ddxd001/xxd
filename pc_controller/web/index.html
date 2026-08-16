@@ -564,33 +564,6 @@
   button kbd { background: rgba(255, 255, 255, 0.25); border: none; color: inherit; font-size: 10px; padding: 1px 5px; }
   button.ghost kbd, button:not(.primary):not(.danger) kbd { background: rgba(0, 0, 0, 0.06); color: var(--text-secondary); }
 
-  /* ---- modal (Apple-style confirm sheet) ---- */
-  .modal-backdrop {
-    position: fixed; inset: 0;
-    background: rgba(0, 0, 0, 0.3);
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
-    display: flex; align-items: center; justify-content: center;
-    z-index: 200;
-    opacity: 0; pointer-events: none;
-    transition: opacity 200ms;
-  }
-  .modal-backdrop.open { opacity: 1; pointer-events: auto; }
-  .modal {
-    background: var(--card-solid);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-pop);
-    width: min(400px, calc(100vw - 40px));
-    padding: 24px;
-    transform: scale(0.95);
-    transition: transform 200ms;
-  }
-  .modal-backdrop.open .modal { transform: scale(1); }
-  .modal h3 { font-size: 17px; font-weight: 600; margin-bottom: 8px; text-align: center; }
-  .modal p { font-size: 14px; color: var(--text-secondary); text-align: center; margin-bottom: 20px; }
-  .modal .modal-actions { display: flex; gap: 10px; }
-  .modal .modal-actions button { flex: 1; min-height: 44px; }
-
   /* ---- toast ---- */
   #toasts {
     position: fixed; top: 64px; left: 50%; transform: translateX(-50%);
@@ -667,36 +640,34 @@
   </div>
 </header>
 
-<!-- left: control & calibration -->
-<section class="hud-panel hud-left" aria-label="控制与标定">
-  <h2>控制与标定</h2>
+<!-- left: control -->
+<section class="hud-panel hud-left" aria-label="控制">
+  <h2>控制</h2>
   <div class="btn-row">
     <button class="primary" id="btn-arm" disabled>使能 <kbd>Enter</kbd></button>
     <button class="danger" id="btn-stop">立即停用 <kbd>Space</kbd></button>
   </div>
   <div class="btn-row">
     <button id="btn-clear-fault">清除故障</button>
-    <button id="btn-home">回零…</button>
-    <button id="btn-calibrate">开始上限标定…</button>
   </div>
   <div class="field-row">
-    <span class="field-label">速度比例</span>
-    <input type="range" id="speed-slider" min="5" max="100" step="1" value="20" aria-label="速度比例">
+    <span class="field-label">底盘速度</span>
+    <input type="range" id="speed-slider" min="5" max="100" step="1" value="20" aria-label="底盘速度">
     <span class="field-value" id="speed-value">20%</span>
+  </div>
+  <div class="field-row">
+    <span class="field-label">升降速度</span>
+    <input type="range" id="lift-speed-slider" min="10" max="100" step="5" value="60" aria-label="升降速度">
+    <span class="field-value" id="lift-speed-value">60%</span>
   </div>
   <div class="field-row">
     <span class="field-label">手柄死区</span>
     <input type="number" id="deadzone-input" min="0" max="0.8" step="0.01" value="0.12" aria-label="手柄死区">
   </div>
-  <div class="field-row">
-    <span class="field-label">软上限</span>
-    <input type="number" id="upper-input" min="0" max="99999999" step="1" value="0" aria-label="软上限计数">
-    <button id="btn-send-upper">发送软上限</button>
-    <button id="btn-capture-upper">捕获当前为软上限</button>
-  </div>
   <p class="panel-help">
     <kbd>W</kbd><kbd>S</kbd> 前后 · <kbd>A</kbd><kbd>D</kbd> 左右 · <kbd>Q</kbd><kbd>E</kbd> 旋转 · <kbd>R</kbd><kbd>F</kbd> 升降 ·
     <kbd>Enter</kbd> 切换使能 · <kbd>Space</kbd> 立即停用<br>
+    升降没有上端硬件或软件限位；每次上电前必须人工放到最低位。<br>
     窗口失焦、手柄断开、串口关闭或页面离开时自动发送零速停用。
   </p>
 </section>
@@ -811,17 +782,6 @@
   </div>
 </section>
 
-<div class="modal-backdrop" id="modal-backdrop" role="dialog" aria-modal="true">
-  <div class="modal">
-    <h3 id="modal-title"></h3>
-    <p id="modal-body"></p>
-    <div class="modal-actions">
-      <button id="modal-cancel">取消</button>
-      <button class="danger" id="modal-confirm">确认</button>
-    </div>
-  </div>
-</div>
-
 <div id="toasts" aria-live="polite"></div>
 
 <script>
@@ -830,7 +790,7 @@
 /* ================= WebSocket ================= */
 let ws = null;
 let wsOpen = false;
-let config = { speed_scale: 0.2, gamepad_deadzone: 0.12, gamepad_axes: {left_x:0,left_y:1,right_x:2}, gamepad_buttons: {left_shoulder:4,right_shoulder:5,start:7,stop:1}, upper_limit_counts: 0 };
+let config = { speed_scale: 0.2, lift_speed_scale: 0.6, gamepad_deadzone: 0.12, gamepad_axes: {left_x:0,left_y:1,right_x:2}, gamepad_buttons: {left_shoulder:4,right_shoulder:5,start:7,stop:1} };
 let telemetry = null;
 let lastTelemetryAt = 0;
 let telemetryStaleNotified = false;
@@ -936,28 +896,6 @@ function toast(text) {
   setTimeout(() => el.remove(), 3000);
 }
 
-function confirmSheet(title, body, confirmText) {
-  return new Promise((resolve) => {
-    const backdrop = $("modal-backdrop");
-    $("modal-title").textContent = title;
-    $("modal-body").textContent = body;
-    $("modal-confirm").textContent = confirmText || "确认";
-    backdrop.classList.add("open");
-    $("modal-confirm").focus();
-    const done = (ok) => {
-      backdrop.classList.remove("open");
-      $("modal-confirm").onclick = $("modal-cancel").onclick = backdrop.onclick = null;
-      document.removeEventListener("keydown", onKey);
-      resolve(ok);
-    };
-    const onKey = (e) => { if (e.key === "Escape") done(false); };
-    $("modal-confirm").onclick = () => done(true);
-    $("modal-cancel").onclick = () => done(false);
-    backdrop.onclick = (e) => { if (e.target === backdrop) done(false); };
-    document.addEventListener("keydown", onKey);
-  });
-}
-
 function fillPorts(ports) {
   const sel = $("port-select");
   const current = sel.value || config.com_port || "";
@@ -981,8 +919,9 @@ function fillPorts(ports) {
 function applyConfigToUi() {
   $("speed-slider").value = Math.round((config.speed_scale || 0.2) * 100);
   $("speed-value").textContent = $("speed-slider").value + "%";
+  $("lift-speed-slider").value = Math.round((config.lift_speed_scale || 0.6) * 100);
+  $("lift-speed-value").textContent = $("lift-speed-slider").value + "%";
   $("deadzone-input").value = config.gamepad_deadzone ?? 0.12;
-  $("upper-input").value = config.upper_limit_counts ?? 0;
 }
 
 const SERVO_NAMES = ["ID1", "ID2", "ID3", "ID4 升降"];
@@ -1034,8 +973,8 @@ function renderTelemetry() {
   $("snapshot-text").textContent = t.fault_snapshot.fault_text;
   $("link-text").textContent = `${t.link_age_ms} ms，帧序号 ${t.last_control_sequence}`;
   $("lift-text").textContent =
-    `位置 ${t.lift_position} / 目标 ${t.lift_target} / 上限 ${t.upper_limit}，` +
-    `回零=${t.homed ? "是" : "否"}，原点=${t.home_switch ? "触发" : "正常"}`;
+    `位置 ${t.lift_position} / 目标 ${t.lift_target}，` +
+    `零点=${t.homed ? "有效" : "无效"}，下限开关=未使用`;
   if (connected) {
     $("conn-dot").className = "conn-dot on";
     $("conn-text").textContent = "已连接，收到遥测";
@@ -1064,10 +1003,6 @@ function updateButtonStates() {
   $("btn-arm").disabled = !ready;
   $("btn-arm").innerHTML = (active ? "停用" : "使能") + " <kbd>Enter</kbd>";
   $("btn-arm").className = active ? "danger" : "primary";
-  $("btn-calibrate").disabled = !(ready && t.state === 2 && t.homed && !t.fault_bits && !t.upper_limit);
-  $("btn-capture-upper").disabled = !(ready && t.state === 5 && t.homed && t.lift_position > 0);
-  // CONFIG 只允许在停用相关状态发送（固件在 ARMED/HOMING 会忽略）
-  $("btn-send-upper").disabled = !(ready && (t.state === 0 || t.state === 2 || t.state === 4 || t.state === 5));
 }
 
 /* ================= input: keyboard + pad + gamepad ================= */
@@ -1152,7 +1087,14 @@ function currentMotion() {
 }
 setInterval(() => {
   const m = document.hidden ? { vx: 0, vy: 0, omega: 0, lift: 0 } : currentMotion();
-  latestMotion = m;
+  const chassisScale = Math.max(0.05, Math.min(1, Number(config.speed_scale) || 0.2));
+  const liftScale = Math.max(0.1, Math.min(1, Number(config.lift_speed_scale) || 0.6));
+  latestMotion = {
+    vx: m.vx * chassisScale,
+    vy: m.vy * chassisScale,
+    omega: m.omega * chassisScale,
+    lift: m.lift * liftScale,
+  };
   send(Object.assign({ type: "motion" }, m));
 }, 50);
 
@@ -1174,26 +1116,6 @@ function stopNow() {
 $("btn-arm").onclick = toggleArm;
 $("btn-stop").onclick = stopNow;
 $("btn-clear-fault").onclick = () => send({ type: "action", name: "clear_fault" });
-$("btn-home").onclick = async () => {
-  if (await confirmSheet("确认回零", "确认底盘已架空、升降下方无人和障碍物，并开始向下回零？", "开始回零")) {
-    send({ type: "action", name: "home" });
-  }
-};
-$("btn-calibrate").onclick = async () => {
-  if (await confirmSheet("确认上限标定", "标定期间底盘保持停用，只允许按 R 低速上升。请确认升降空载、上方无人且随时准备按 Space 停止。", "开始标定")) {
-    send({ type: "action", name: "calibrate" });
-  }
-};
-$("btn-capture-upper").onclick = async () => {
-  const pos = telemetry ? telemetry.lift_position : 0;
-  if (await confirmSheet("确认软上限", `将当前位置 ${pos} 保存为软上限？`, "保存")) {
-    send({ type: "capture_upper_limit" });
-  }
-};
-$("btn-send-upper").onclick = () => {
-  const value = parseInt($("upper-input").value, 10);
-  send({ type: "send_upper_limit", value: Number.isFinite(value) ? value : 0 });
-};
 
 $("btn-connect").onclick = () => {
   if (connected) {
@@ -1212,6 +1134,13 @@ $("speed-slider").addEventListener("input", () => {
   clearTimeout(configSaveTimer);
   configSaveTimer = setTimeout(() => {
     send({ type: "set_config", speed_scale: parseInt($("speed-slider").value, 10) / 100 });
+  }, 300);
+});
+$("lift-speed-slider").addEventListener("input", () => {
+  $("lift-speed-value").textContent = $("lift-speed-slider").value + "%";
+  clearTimeout(configSaveTimer);
+  configSaveTimer = setTimeout(() => {
+    send({ type: "set_config", lift_speed_scale: parseInt($("lift-speed-slider").value, 10) / 100 });
   }, 300);
 });
 $("deadzone-input").addEventListener("change", () => {

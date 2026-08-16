@@ -11,7 +11,6 @@
 
 #define LORA_RX_RING_SIZE       (256U)
 #define CONTROL_PAYLOAD_LENGTH  (10U)
-#define CONFIG_PAYLOAD_LENGTH   (4U)
 #define TELEMETRY_PAYLOAD_SIZE  (85U)
 
 typedef struct st_robot_command
@@ -30,21 +29,14 @@ typedef struct st_robot_runtime
     robot_wheel_ramp_t wheel_ramp;
     int16_t       wheel_speed[3];
     int16_t       servo_speed[STS3215_SERVO_COUNT];
-    bool          homed;
-    bool          upper_limit_valid;
-    int32_t       upper_limit_counts;
+    bool          lift_zero_valid;
     int32_t       lift_position;
     int32_t       lift_target;
     int16_t       previous_lift_raw;
     bool          lift_feedback_valid;
+    bool          lift_manual_active;
     uint32_t      lift_feedback_stamp;
     bool          lift_was_online;
-    bool          home_switch;
-    bool          home_raw;
-    uint8_t       home_stable_ms;
-    uint32_t      homing_start_ms;
-    uint32_t      homing_progress_ms;
-    int32_t       homing_progress_position;
     uint32_t      last_control_ms;
     uint32_t      last_control_tick;
     uint32_t      last_servo_tick;
@@ -58,7 +50,10 @@ typedef struct st_robot_runtime
     uint32_t      recovery_window_start_ms;
     uint8_t       recovery_attempts;
     bool          recovery_clear_pending;
-    uint16_t      servo_temp_status_ms[STS3215_SERVO_COUNT];
+    uint32_t      fault_auto_clear_ms;
+    bool          fault_auto_clear_pending;
+    bool          temperature_fault_latched;
+    uint16_t      servo_numeric_temp_ms[STS3215_SERVO_COUNT];
     bool          fault_snapshot_valid;
     uint8_t       fault_snapshot_servo_id;
     uint8_t       fault_snapshot_protocol_error;
@@ -69,8 +64,6 @@ typedef struct st_robot_runtime
 
 static robot_runtime_t g_robot;
 static volatile uint32_t g_milliseconds;
-static volatile bool g_home_irq_seen;
-
 static uint8_t g_lora_rx_byte;
 static volatile uint16_t g_lora_rx_head;
 static volatile uint16_t g_lora_rx_tail;
@@ -106,8 +99,18 @@ static int32_t clamp_i32 (int32_t value, int32_t minimum, int32_t maximum)
     return value;
 }
 
+static void capture_lift_hold_target (void)
+{
+    if (g_robot.lift_zero_valid && g_robot.lift_feedback_valid)
+    {
+        g_robot.lift_target = (g_robot.lift_position > 0) ? g_robot.lift_position : 0;
+    }
+    g_robot.lift_manual_active = false;
+}
+
 static void set_zero_motion (void)
 {
+    capture_lift_hold_target();
     memset(&g_robot.command, 0, sizeof(g_robot.command));
     robot_kinematics_stop(&g_robot.wheel_ramp);
     memset(g_robot.wheel_speed, 0, sizeof(g_robot.wheel_speed));
@@ -118,13 +121,14 @@ static void enter_fault (uint32_t fault)
 {
     g_robot.fault_bits |= fault;
     g_robot.state = ROBOT_STATE_FAULT;
+    g_robot.fault_auto_clear_pending = false;
     set_zero_motion();
 }
 
 static void enter_disarmed (void)
 {
     g_robot.state = (0U != g_robot.fault_bits) ? ROBOT_STATE_FAULT :
-                    (g_robot.homed ? ROBOT_STATE_DISARMED_HOMED : ROBOT_STATE_DISARMED_UNHOMED);
+                    (g_robot.lift_zero_valid ? ROBOT_STATE_DISARMED_HOMED : ROBOT_STATE_DISARMED_UNHOMED);
     set_zero_motion();
 }
 
@@ -163,6 +167,8 @@ static void enter_servo_recovery (uint32_t now_ms)
     g_robot.recovery_clear_pending = false;
     g_robot.fault_bits |= ROBOT_FAULT_SERVO_STATUS;
     g_robot.state = ROBOT_STATE_RECOVERING;
+    g_robot.command.lift = 0;
+    capture_lift_hold_target();
     stop_outputs_preserve_command();
 }
 
@@ -191,34 +197,40 @@ static void clear_fault_if_safe (void)
         g_robot.fault_snapshot_status_flags = 0U;
         g_robot.fault_snapshot_temperature_c = 0U;
         g_robot.fault_snapshot_temperature_limit_c = 0U;
+        g_robot.fault_auto_clear_pending = false;
+        g_robot.temperature_fault_latched = false;
         (void) sts3215_set_torque(true);
         enter_disarmed();
     }
 }
 
-static void start_homing (uint32_t now_ms)
+static void attempt_servo_fault_auto_clear (uint32_t now_ms, bool servo_fault_active)
 {
-    if ((ROBOT_STATE_ARMED != g_robot.state) && (ROBOT_STATE_FAULT != g_robot.state) && sts3215_all_online())
+    if ((ROBOT_STATE_FAULT != g_robot.state) ||
+        (ROBOT_FAULT_SERVO_STATUS != g_robot.fault_bits) || g_robot.temperature_fault_latched ||
+        servo_fault_active || !sts3215_all_online() || sts3215_any_serious_fault())
     {
-        g_robot.homed = false;
-        g_robot.state = ROBOT_STATE_HOMING;
-        g_robot.homing_start_ms = now_ms;
-        g_robot.homing_progress_ms = now_ms;
-        g_robot.homing_progress_position = g_robot.lift_position;
-        set_zero_motion();
-        g_robot.servo_speed[3] = ROBOT_LIFT_HOME_SPEED;
+        g_robot.fault_auto_clear_pending = false;
+        return;
     }
-}
 
-static void start_calibration (void)
-{
-    if ((ROBOT_STATE_DISARMED_HOMED == g_robot.state) && g_robot.homed && !g_robot.upper_limit_valid &&
-        g_robot.lift_feedback_valid && (0U == g_robot.fault_bits) && sts3215_all_online())
+    if (!g_robot.fault_auto_clear_pending)
     {
-        set_zero_motion();
-        g_robot.lift_target = g_robot.lift_position;
-        g_robot.state = ROBOT_STATE_CALIBRATING;
+        g_robot.fault_auto_clear_pending = true;
+        g_robot.fault_auto_clear_ms = now_ms;
+        return;
     }
+    if ((uint32_t) (now_ms - g_robot.fault_auto_clear_ms) < ROBOT_SERVO_FAULT_AUTO_CLEAR_MS)
+    {
+        return;
+    }
+
+    /* Keep the fault snapshot for diagnostics, but clear the live fault and
+     * return to DISARMED. A recovered servo fault never automatically re-arms. */
+    g_robot.fault_bits &= ~(uint32_t) ROBOT_FAULT_SERVO_STATUS;
+    g_robot.fault_auto_clear_pending = false;
+    (void) sts3215_set_torque(true);
+    enter_disarmed();
 }
 
 static void handle_control_frame (robot_frame_t const * frame, uint32_t now_ms)
@@ -252,16 +264,7 @@ static void handle_control_frame (robot_frame_t const * frame, uint32_t now_ms)
     {
         clear_fault_if_safe();
     }
-    if (0U != (flags & ROBOT_FLAG_HOME))
-    {
-        start_homing(now_ms);
-        return;
-    }
-    if (0U != (flags & ROBOT_FLAG_CALIBRATE))
-    {
-        start_calibration();
-        return;
-    }
+    /* HOME and CALIBRATE remain reserved in protocol v3 but intentionally do nothing. */
     if ((0U != (flags & ROBOT_FLAG_ARM)) &&
         ((ROBOT_STATE_DISARMED_UNHOMED == g_robot.state) || (ROBOT_STATE_DISARMED_HOMED == g_robot.state)) &&
         (0U == g_robot.fault_bits) && sts3215_all_online())
@@ -275,43 +278,6 @@ static void handle_control_frame (robot_frame_t const * frame, uint32_t now_ms)
         g_robot.command.vy = vy;
         g_robot.command.omega = omega;
         g_robot.command.lift = lift;
-    }
-    else if (ROBOT_STATE_CALIBRATING == g_robot.state)
-    {
-        g_robot.command.vx = 0;
-        g_robot.command.vy = 0;
-        g_robot.command.omega = 0;
-        g_robot.command.lift = lift;
-    }
-}
-
-static void handle_config_frame (robot_frame_t const * frame)
-{
-    if ((frame->length != CONFIG_PAYLOAD_LENGTH) || (ROBOT_STATE_ARMED == g_robot.state) ||
-        (ROBOT_STATE_HOMING == g_robot.state))
-    {
-        return;
-    }
-    int32_t const upper_limit = robot_protocol_get_i32(frame->payload);
-    if ((upper_limit > 0) && (upper_limit < 100000000))
-    {
-        bool const was_calibrating = (ROBOT_STATE_CALIBRATING == g_robot.state);
-        g_robot.upper_limit_counts = upper_limit;
-        g_robot.upper_limit_valid = true;
-        if (was_calibrating)
-        {
-            g_robot.lift_target = clamp_i32(g_robot.lift_position, 0, upper_limit);
-            set_zero_motion();
-            g_robot.state = ROBOT_STATE_DISARMED_HOMED;
-        }
-        else if (g_robot.homed)
-        {
-            g_robot.lift_target = clamp_i32(g_robot.lift_target, 0, upper_limit);
-        }
-    }
-    else
-    {
-        g_robot.upper_limit_valid = false;
     }
 }
 
@@ -328,41 +294,12 @@ static void consume_lora (uint32_t now_ms)
             {
                 handle_control_frame(&frame, now_ms);
             }
-            else if (ROBOT_MSG_CONFIG == frame.type)
-            {
-                handle_config_frame(&frame);
-            }
             else
             {
-                /* Unsupported messages are intentionally ignored. */
+                /* CONFIG and unsupported messages are intentionally ignored. */
             }
         }
     }
-}
-
-static void update_home_switch (void)
-{
-    bsp_io_level_t level = BSP_IO_LEVEL_LOW;
-    (void) g_ioport.p_api->pinRead(g_ioport.p_ctrl, BSP_IO_PORT_05_PIN_02, &level);
-    bool const raw = (BSP_IO_LEVEL_HIGH == level);
-    if (raw == g_robot.home_raw)
-    {
-        if (g_robot.home_stable_ms < ROBOT_HOME_DEBOUNCE_MS)
-        {
-            uint16_t const elapsed = (uint16_t) g_robot.home_stable_ms + ROBOT_CONTROL_PERIOD_MS;
-            g_robot.home_stable_ms = (uint8_t) ((elapsed > ROBOT_HOME_DEBOUNCE_MS) ? ROBOT_HOME_DEBOUNCE_MS : elapsed);
-        }
-        if (g_robot.home_stable_ms >= ROBOT_HOME_DEBOUNCE_MS)
-        {
-            g_robot.home_switch = raw;
-        }
-    }
-    else
-    {
-        g_robot.home_raw = raw;
-        g_robot.home_stable_ms = 0U;
-    }
-    g_home_irq_seen = false;
 }
 
 static void update_lift_feedback (void)
@@ -372,8 +309,7 @@ static void update_lift_feedback (void)
     {
         if (g_robot.lift_was_online)
         {
-            g_robot.homed = false;
-            g_robot.upper_limit_valid = false;
+            g_robot.lift_zero_valid = false;
         }
         g_robot.lift_was_online = false;
         g_robot.lift_feedback_valid = false;
@@ -382,7 +318,6 @@ static void update_lift_feedback (void)
 
     if (!g_robot.lift_was_online)
     {
-        g_robot.homed = false;
         g_robot.lift_feedback_valid = false;
         g_robot.lift_was_online = true;
     }
@@ -411,13 +346,32 @@ static void update_lift_feedback (void)
     {
         delta += 4096;
     }
-    g_robot.lift_position += delta;
+    g_robot.lift_position += delta * ROBOT_LIFT_FEEDBACK_DIRECTION;
     g_robot.previous_lift_raw = raw;
+}
+
+static int16_t lift_output_speed (int16_t logical_speed)
+{
+    return (int16_t) (logical_speed * ROBOT_LIFT_MOTOR_DIRECTION);
+}
+
+static int16_t lift_manual_speed (int16_t command)
+{
+    int32_t speed = ((int32_t) command * ROBOT_LIFT_MAX_SPEED) / 1000;
+    speed = clamp_i32(speed, -ROBOT_LIFT_MAX_SPEED, ROBOT_LIFT_MAX_SPEED);
+    /* There is no lower-limit switch. The operator places the lift at its true
+     * lowest position before power-up, and the unfolded encoder position is
+     * then the only lower-bound reference. */
+    if ((g_robot.lift_position <= 0) && (speed < 0))
+    {
+        speed = 0;
+    }
+    return (int16_t) speed;
 }
 
 static int16_t lift_hold_speed (void)
 {
-    if (!g_robot.homed || !g_robot.upper_limit_valid || !g_robot.lift_feedback_valid)
+    if (!g_robot.lift_zero_valid || !g_robot.lift_feedback_valid)
     {
         return 0;
     }
@@ -429,10 +383,6 @@ static int16_t lift_hold_speed (void)
     int32_t speed = (error * ROBOT_LIFT_POSITION_KP_NUM) / ROBOT_LIFT_POSITION_KP_DEN;
     speed = clamp_i32(speed, -ROBOT_LIFT_MAX_SPEED, ROBOT_LIFT_MAX_SPEED);
     if ((g_robot.lift_position <= 0) && (speed < 0))
-    {
-        speed = 0;
-    }
-    if ((g_robot.lift_position >= g_robot.upper_limit_counts) && (speed > 0))
     {
         speed = 0;
     }
@@ -455,7 +405,7 @@ static void capture_servo_fault_snapshot (uint8_t index, sts3215_status_t const 
                                                    status->temperature_limit_c : 0U;
 }
 
-static void evaluate_servo_faults (bool * hard_fault, bool * recoverable_fault)
+static void evaluate_servo_faults (bool * hard_fault, bool * recoverable_fault, bool * temperature_fault)
 {
     uint8_t const recoverable_mask = STS3215_STATUS_VOLTAGE | STS3215_STATUS_CURRENT |
                                      STS3215_STATUS_OVERLOAD;
@@ -463,12 +413,13 @@ static void evaluate_servo_faults (bool * hard_fault, bool * recoverable_fault)
 
     *hard_fault = false;
     *recoverable_fault = false;
+    *temperature_fault = false;
     for (uint8_t i = 0U; i < STS3215_SERVO_COUNT; i++)
     {
         sts3215_status_t const * status = sts3215_status(i);
         if ((NULL == status) || !status->online)
         {
-            g_robot.servo_temp_status_ms[i] = 0U;
+            g_robot.servo_numeric_temp_ms[i] = 0U;
             continue;
         }
 
@@ -479,24 +430,36 @@ static void evaluate_servo_faults (bool * hard_fault, bool * recoverable_fault)
             capture_servo_fault_snapshot(i, status);
         }
 
-        bool confirmed_temperature_status = false;
-        if (0U != (flags & STS3215_STATUS_TEMPERATURE))
+        bool confirmed_numeric_over_temperature = false;
+        if (numeric_over_temperature)
         {
-            uint32_t const elapsed = (uint32_t) g_robot.servo_temp_status_ms[i] + ROBOT_CONTROL_PERIOD_MS;
-            g_robot.servo_temp_status_ms[i] = (uint16_t) ((elapsed > UINT16_MAX) ? UINT16_MAX : elapsed);
-            confirmed_temperature_status = g_robot.servo_temp_status_ms[i] >= ROBOT_TEMP_STATUS_CONFIRM_MS;
+            uint32_t const elapsed = (uint32_t) g_robot.servo_numeric_temp_ms[i] + ROBOT_CONTROL_PERIOD_MS;
+            g_robot.servo_numeric_temp_ms[i] = (uint16_t) ((elapsed > UINT16_MAX) ? UINT16_MAX : elapsed);
+            confirmed_numeric_over_temperature =
+                g_robot.servo_numeric_temp_ms[i] >= ROBOT_TEMP_NUMERIC_CONFIRM_MS;
         }
         else
         {
-            g_robot.servo_temp_status_ms[i] = 0U;
+            g_robot.servo_numeric_temp_ms[i] = 0U;
         }
 
         bool const hard_status = 0U != (flags & hard_status_mask);
         bool const recoverable_status = 0U != (flags & recoverable_mask);
-        if (numeric_over_temperature || confirmed_temperature_status || hard_status)
+        if (confirmed_numeric_over_temperature || hard_status)
         {
             *hard_fault = true;
             capture_servo_fault_snapshot(i, status);
+        }
+        if (confirmed_numeric_over_temperature)
+        {
+            *temperature_fault = true;
+            if (!g_robot.temperature_fault_latched)
+            {
+                /* Replace an older diagnostic-only temperature snapshot with
+                 * the sample that actually satisfied the 500 ms trip rule. */
+                g_robot.fault_snapshot_valid = false;
+                capture_servo_fault_snapshot(i, status);
+            }
         }
         if (recoverable_status)
         {
@@ -508,13 +471,13 @@ static void evaluate_servo_faults (bool * hard_fault, bool * recoverable_fault)
 
 static void control_tick (uint32_t now_ms)
 {
-    update_home_switch();
     update_lift_feedback();
 
     bool const servo_offline = (now_ms >= ROBOT_SERVO_STARTUP_GRACE_MS) && !sts3215_all_online();
     bool hard_servo_fault;
     bool recoverable_servo_fault;
-    evaluate_servo_faults(&hard_servo_fault, &recoverable_servo_fault);
+    bool temperature_servo_fault;
+    evaluate_servo_faults(&hard_servo_fault, &recoverable_servo_fault, &temperature_servo_fault);
 
     if (servo_offline)
     {
@@ -523,6 +486,10 @@ static void control_tick (uint32_t now_ms)
     else if (hard_servo_fault)
     {
         enter_fault(ROBOT_FAULT_SERVO_STATUS);
+        if (temperature_servo_fault)
+        {
+            g_robot.temperature_fault_latched = true;
+        }
     }
     else if (recoverable_servo_fault)
     {
@@ -552,9 +519,9 @@ static void control_tick (uint32_t now_ms)
     {
         g_robot.recovery_attempts = 0U;
     }
+    attempt_servo_fault_auto_clear(now_ms, servo_offline || hard_servo_fault || recoverable_servo_fault);
     if (g_robot.control_received && ((uint32_t) (now_ms - g_robot.last_control_ms) > ROBOT_LINK_TIMEOUT_MS) &&
-        ((ROBOT_STATE_ARMED == g_robot.state) || (ROBOT_STATE_HOMING == g_robot.state) ||
-         (ROBOT_STATE_CALIBRATING == g_robot.state) || (ROBOT_STATE_RECOVERING == g_robot.state)))
+        ((ROBOT_STATE_ARMED == g_robot.state) || (ROBOT_STATE_RECOVERING == g_robot.state)))
     {
         enter_fault(ROBOT_FAULT_LINK_TIMEOUT);
     }
@@ -562,50 +529,6 @@ static void control_tick (uint32_t now_ms)
     if (ROBOT_STATE_RECOVERING == g_robot.state)
     {
         stop_outputs_preserve_command();
-        return;
-    }
-
-    if (ROBOT_STATE_HOMING == g_robot.state)
-    {
-        memset(g_robot.servo_speed, 0, sizeof(g_robot.servo_speed));
-        g_robot.servo_speed[3] = ROBOT_LIFT_HOME_SPEED;
-        if (g_robot.home_switch)
-        {
-            g_robot.servo_speed[3] = 0;
-            g_robot.lift_position = 0;
-            g_robot.lift_target = 0;
-            g_robot.homed = true;
-            g_robot.state = ROBOT_STATE_DISARMED_HOMED;
-        }
-        else if ((uint32_t) (now_ms - g_robot.homing_start_ms) >= ROBOT_HOME_TIMEOUT_MS)
-        {
-            enter_fault(ROBOT_FAULT_HOME_TIMEOUT);
-        }
-        else if (g_robot.lift_feedback_valid)
-        {
-            int32_t const progress = g_robot.lift_position - g_robot.homing_progress_position;
-            if ((progress >= ROBOT_HOME_PROGRESS_COUNTS) || (progress <= -ROBOT_HOME_PROGRESS_COUNTS))
-            {
-                g_robot.homing_progress_position = g_robot.lift_position;
-                g_robot.homing_progress_ms = now_ms;
-            }
-            else if ((uint32_t) (now_ms - g_robot.homing_progress_ms) >= ROBOT_HOME_STALL_TIMEOUT_MS)
-            {
-                enter_fault(ROBOT_FAULT_HOME_STALL);
-            }
-        }
-        return;
-    }
-
-    if (ROBOT_STATE_CALIBRATING == g_robot.state)
-    {
-        robot_kinematics_stop(&g_robot.wheel_ramp);
-        memset(g_robot.wheel_speed, 0, sizeof(g_robot.wheel_speed));
-        memset(g_robot.servo_speed, 0, sizeof(g_robot.servo_speed));
-        if (g_robot.command.lift > ROBOT_WHEEL_DEADZONE)
-        {
-            g_robot.servo_speed[3] = ROBOT_LIFT_CALIBRATION_SPEED;
-        }
         return;
     }
 
@@ -618,14 +541,28 @@ static void control_tick (uint32_t now_ms)
         {
             g_robot.servo_speed[i] = g_robot.wheel_speed[i];
         }
-        if (g_robot.homed && g_robot.upper_limit_valid)
+        if (g_robot.lift_zero_valid && g_robot.lift_feedback_valid)
         {
-            int32_t const step = ((int32_t) g_robot.command.lift * ROBOT_LIFT_TARGET_STEP_PER_TICK) / 1000;
-            g_robot.lift_target = clamp_i32(g_robot.lift_target + step, 0, g_robot.upper_limit_counts);
-            g_robot.servo_speed[3] = lift_hold_speed();
+            int16_t logical_lift_speed;
+            if (0 != g_robot.command.lift)
+            {
+                g_robot.lift_manual_active = true;
+                g_robot.lift_target = (g_robot.lift_position > 0) ? g_robot.lift_position : 0;
+                logical_lift_speed = lift_manual_speed(g_robot.command.lift);
+            }
+            else
+            {
+                if (g_robot.lift_manual_active)
+                {
+                    capture_lift_hold_target();
+                }
+                logical_lift_speed = lift_hold_speed();
+            }
+            g_robot.servo_speed[3] = lift_output_speed(logical_lift_speed);
         }
         else
         {
+            g_robot.lift_manual_active = false;
             g_robot.servo_speed[3] = 0;
         }
     }
@@ -633,7 +570,7 @@ static void control_tick (uint32_t now_ms)
              (ROBOT_FAULT_LINK_TIMEOUT == (g_robot.fault_bits & ROBOT_FAULT_LINK_TIMEOUT)))
     {
         memset(g_robot.servo_speed, 0, sizeof(g_robot.servo_speed));
-        g_robot.servo_speed[3] = lift_hold_speed();
+        g_robot.servo_speed[3] = lift_output_speed(lift_hold_speed());
     }
     else
     {
@@ -666,11 +603,11 @@ static void send_telemetry (uint32_t now_ms)
             payload[10] |= (uint8_t) (1U << i);
         }
     }
-    payload[11] = g_robot.home_switch ? 1U : 0U;
-    payload[12] = g_robot.homed ? 1U : 0U;
+    payload[11] = 0U; /* Reserved lower-switch field; no switch is installed. */
+    payload[12] = g_robot.lift_zero_valid ? 1U : 0U;
     robot_protocol_put_i32(&payload[13], g_robot.lift_position);
     robot_protocol_put_i32(&payload[17], g_robot.lift_target);
-    robot_protocol_put_i32(&payload[21], g_robot.upper_limit_valid ? g_robot.upper_limit_counts : 0);
+    robot_protocol_put_i32(&payload[21], 0);
     for (uint8_t i = 0U; i < 3U; i++)
     {
         robot_protocol_put_i16(&payload[25U + (i * 2U)], g_robot.wheel_speed[i]);
@@ -714,7 +651,10 @@ static void send_telemetry (uint32_t now_ms)
 bool robot_app_init (void)
 {
     memset(&g_robot, 0, sizeof(g_robot));
-    g_robot.state = ROBOT_STATE_DISARMED_UNHOMED;
+    g_robot.state = ROBOT_STATE_DISARMED_HOMED;
+    g_robot.lift_zero_valid = true;
+    g_robot.lift_position = 0;
+    g_robot.lift_target = 0;
     robot_protocol_parser_init(&g_lora_parser);
 
     bool ok = sts3215_init();
@@ -733,11 +673,6 @@ bool robot_app_init (void)
 
     if ((FSP_SUCCESS != g_system_tick.p_api->open(g_system_tick.p_ctrl, g_system_tick.p_cfg)) ||
         (FSP_SUCCESS != g_system_tick.p_api->start(g_system_tick.p_ctrl)))
-    {
-        ok = false;
-    }
-    if ((FSP_SUCCESS != g_home_irq.p_api->open(g_home_irq.p_ctrl, g_home_irq.p_cfg)) ||
-        (FSP_SUCCESS != g_home_irq.p_api->enable(g_home_irq.p_ctrl)))
     {
         ok = false;
     }
@@ -787,8 +722,9 @@ void system_tick_callback (timer_callback_args_t * p_args)
 
 void home_irq_callback (external_irq_callback_args_t * p_args)
 {
+    /* Retained only because the generated FSP configuration references this
+     * symbol. g_home_irq is never opened, so P502 has no runtime effect. */
     FSP_PARAMETER_NOT_USED(p_args);
-    g_home_irq_seen = true;
 }
 
 void servo_uart_callback (uart_callback_args_t * p_args)

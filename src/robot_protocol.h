@@ -12,7 +12,7 @@
 typedef enum e_robot_message_type
 {
     ROBOT_MSG_CONTROL   = 0x01,
-    ROBOT_MSG_CONFIG    = 0x02,
+    ROBOT_MSG_CONFIG    = 0x02, /* Reserved by protocol v3; firmware ignores it. */
     ROBOT_MSG_TELEMETRY = 0x81
 } robot_message_type_t;
 
@@ -20,9 +20,9 @@ enum
 {
     ROBOT_FLAG_ARM         = (1U << 0),
     ROBOT_FLAG_DISARM      = (1U << 1),
-    ROBOT_FLAG_HOME        = (1U << 2),
+    ROBOT_FLAG_HOME        = (1U << 2), /* Reserved; no operation. */
     ROBOT_FLAG_CLEAR_FAULT = (1U << 3),
-    ROBOT_FLAG_CALIBRATE   = (1U << 4)
+    ROBOT_FLAG_CALIBRATE   = (1U << 4)  /* Reserved; no operation. */
 };
 
 typedef struct st_robot_frame
