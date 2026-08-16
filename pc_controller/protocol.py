@@ -10,6 +10,7 @@ HEADER = b"\xA5\x5A"
 VERSION = 3
 MSG_CONTROL = 0x01
 MSG_CONFIG = 0x02
+MSG_FACE_EVENT = 0x03
 MSG_TELEMETRY = 0x81
 MAX_PAYLOAD = 96
 
@@ -86,6 +87,13 @@ def encode_control(sequence: int, vx: int, vy: int, omega: int, lift: int, flags
 
 def encode_config(sequence: int, upper_limit_counts: int) -> bytes:
     return encode_frame(MSG_CONFIG, sequence, struct.pack("<i", int(upper_limit_counts)))
+
+
+def encode_face_event(sequence: int, event_code: int) -> bytes:
+    code = int(event_code)
+    if not 0 <= code <= 0x0A:
+        raise ValueError("face event code must be in range 0x00..0x0A")
+    return encode_frame(MSG_FACE_EVENT, sequence, bytes((code,)))
 
 
 @dataclass(frozen=True)

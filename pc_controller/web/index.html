@@ -664,9 +664,28 @@
     <span class="field-label">手柄死区</span>
     <input type="number" id="deadzone-input" min="0" max="0.8" step="0.01" value="0.12" aria-label="手柄死区">
   </div>
+  <div class="field-row">
+    <span class="field-label">表情 / 语音</span>
+    <select id="face-event-select" aria-label="屏幕与扬声器事件">
+      <option value="0">00 待机</option>
+      <option value="1">01 启动</option>
+      <option value="2">02 欢迎回家</option>
+      <option value="3">03 机器人移动中</option>
+      <option value="4">04 请缓慢移动</option>
+      <option value="5">05 请停止</option>
+      <option value="6">06 开始充电</option>
+      <option value="7">07 充电完成</option>
+      <option value="8">08 检测到儿童</option>
+      <option value="9">09 任务完成</option>
+      <option value="10">0A 安全停靠</option>
+    </select>
+    <button id="btn-face-event" disabled>发送</button>
+  </div>
+  <div class="panel-help" id="face-event-status">连接并收到遥测后可发送；Linux 端无执行确认。</div>
   <p class="panel-help">
     <kbd>W</kbd><kbd>S</kbd> 前后 · <kbd>A</kbd><kbd>D</kbd> 左右 · <kbd>Q</kbd><kbd>E</kbd> 旋转 · <kbd>R</kbd><kbd>F</kbd> 升降 ·
     <kbd>Enter</kbd> 切换使能 · <kbd>Space</kbd> 立即停用<br>
+    手柄 <kbd>X</kbd>/<kbd>Y</kbd>/<kbd>A</kbd>/<kbd>B</kbd>：启动 / 开始充电 / 充电完成 / 安全停靠（B 同时停用机器人）<br>
     升降没有上端硬件或软件限位；每次上电前必须人工放到最低位。<br>
     窗口失焦、手柄断开、串口关闭或页面离开时自动发送零速停用。
   </p>
@@ -790,7 +809,7 @@
 /* ================= WebSocket ================= */
 let ws = null;
 let wsOpen = false;
-let config = { speed_scale: 0.2, lift_speed_scale: 0.6, gamepad_deadzone: 0.12, gamepad_axes: {left_x:0,left_y:1,right_x:2}, gamepad_buttons: {left_shoulder:4,right_shoulder:5,start:7,stop:1} };
+let config = { speed_scale: 0.2, lift_speed_scale: 0.6, gamepad_deadzone: 0.12, gamepad_axes: {left_x:0,left_y:1,right_x:2}, gamepad_buttons: {left_shoulder:4,right_shoulder:5,start:7,stop:1,face_startup:2,face_charge_start:3,face_charge_complete:0,face_safe_dock:1} };
 let telemetry = null;
 let lastTelemetryAt = 0;
 let telemetryStaleNotified = false;
@@ -853,6 +872,14 @@ function handleMessage(msg) {
     case "serial_error":
       toast("串口错误：" + msg.message);
       break;
+    case "face_event_status": {
+      const code = Number(msg.code);
+      const hex = Number.isInteger(code) ? "0x" + code.toString(16).toUpperCase().padStart(2, "0") : "--";
+      const text = msg.state === "sent" ? `${hex} 已发送至 RA8P1` : `${hex} 已排队`;
+      $("face-event-status").textContent = text + "；Linux 端无执行确认。";
+      toast(text);
+      break;
+    }
     case "chat_delta":
       chatAppendDelta(msg.text || "");
       break;
@@ -1001,6 +1028,7 @@ function updateButtonStates() {
   const ready = connected && t && !stale;
   const active = t && (t.state === 1 || t.state === 3 || t.state === 5 || t.state === 6);
   $("btn-arm").disabled = !ready;
+  $("btn-face-event").disabled = !ready || !sequenceSynced;
   $("btn-arm").innerHTML = (active ? "停用" : "使能") + " <kbd>Enter</kbd>";
   $("btn-arm").className = active ? "danger" : "primary";
 }
@@ -1067,8 +1095,14 @@ function pollGamepad() {
     for (const [name, fn] of [["start", toggleArm], ["stop", stopNow]]) {
       const n = buttons[name];
       const pressed = !!gp.buttons[n]?.pressed;
-      if (pressed && !gamepadPrev[n]) fn();
-      gamepadPrev[n] = pressed;
+      if (pressed && !gamepadPrev[name]) fn();
+      gamepadPrev[name] = pressed;
+    }
+    for (const [name, code] of [["face_startup", 0x01], ["face_charge_start", 0x06], ["face_charge_complete", 0x07], ["face_safe_dock", 0x0A]]) {
+      const n = buttons[name];
+      const pressed = !!gp.buttons[n]?.pressed;
+      if (pressed && !gamepadPrev[name]) queueFaceEvent(code);
+      gamepadPrev[name] = pressed;
     }
   } catch { /* ignore malformed pads */ }
   return out;
@@ -1116,6 +1150,16 @@ function stopNow() {
 $("btn-arm").onclick = toggleArm;
 $("btn-stop").onclick = stopNow;
 $("btn-clear-fault").onclick = () => send({ type: "action", name: "clear_fault" });
+function queueFaceEvent(code) {
+  if (!connected || !sequenceSynced) {
+    toast("串口未连接或控制序号尚未同步");
+    return;
+  }
+  send({ type: "action", name: "face_event", code });
+}
+$("btn-face-event").onclick = () => {
+  queueFaceEvent(Number.parseInt($("face-event-select").value, 10));
+};
 
 $("btn-connect").onclick = () => {
   if (connected) {

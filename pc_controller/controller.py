@@ -31,6 +31,7 @@ from protocol import (
     Telemetry,
     decode_telemetry,
     encode_control,
+    encode_face_event,
 )
 
 CONFIG_PATH = Path(__file__).with_name("controller_config.json")
@@ -41,7 +42,16 @@ DEFAULT_CONFIG = {
     "lift_speed_scale": 0.60,
     "gamepad_deadzone": 0.12,
     "gamepad_axes": {"left_x": 0, "left_y": 1, "right_x": 2},
-    "gamepad_buttons": {"left_shoulder": 4, "right_shoulder": 5, "start": 7, "stop": 1},
+    "gamepad_buttons": {
+        "left_shoulder": 4,
+        "right_shoulder": 5,
+        "start": 7,
+        "stop": 1,
+        "face_startup": 2,
+        "face_charge_start": 3,
+        "face_charge_complete": 0,
+        "face_safe_dock": 1,
+    },
 }
 
 # ATK-MWCC68D is half duplex. Two control slots are aligned from the
@@ -50,6 +60,20 @@ DEFAULT_CONFIG = {
 CONTROL_SUPERFRAME_S = 0.200
 CONTROL_TX_OFFSETS_S = (0.020, 0.070)
 UI_TICK_MS = 5
+
+FACE_EVENTS = (
+    "00 待机",
+    "01 启动",
+    "02 欢迎回家",
+    "03 机器人移动中",
+    "04 请缓慢移动",
+    "05 请停止",
+    "06 开始充电",
+    "07 充电完成",
+    "08 检测到儿童",
+    "09 任务完成",
+    "0A 安全停靠",
+)
 
 
 class RobotController:
@@ -67,9 +91,10 @@ class RobotController:
         self.telemetry: Telemetry | None = None
         self.keys: set[str] = set()
         self.pending_flags = FLAG_DISARM
+        self.pending_face_event: int | None = None
         self.window_active = True
         self.joystick = None
-        self.gamepad_previous: dict[int, bool] = {}
+        self.gamepad_previous: dict[str, bool] = {}
         self.port_info = {}
         self.tx_epoch = time.monotonic()
         self.tx_cycle = 0
@@ -85,6 +110,8 @@ class RobotController:
         self.link_text = tk.StringVar(value="--")
         self.lift_text = tk.StringVar(value="--")
         self.trigger_text = tk.StringVar(value="无")
+        self.face_event_name = tk.StringVar(value=FACE_EVENTS[0])
+        self.face_event_status = tk.StringVar(value="等待连接")
         self.servo_text = [tk.StringVar(value=f"ID{i + 1}: --") for i in range(4)]
 
         self._build_ui()
@@ -99,7 +126,11 @@ class RobotController:
             try:
                 saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
                 for key, value in saved.items():
-                    if key in config:
+                    if key not in config:
+                        continue
+                    if isinstance(config[key], dict) and isinstance(value, dict):
+                        config[key].update(value)
+                    else:
                         config[key] = value
             except (OSError, ValueError):
                 pass
@@ -114,8 +145,8 @@ class RobotController:
 
     def _build_ui(self) -> None:
         self.root.title("RA8P1 全向底盘控制器")
-        self.root.geometry("720x590")
-        self.root.minsize(680, 550)
+        self.root.geometry("720x650")
+        self.root.minsize(680, 610)
         outer = ttk.Frame(self.root, padding=12)
         outer.pack(fill="both", expand=True)
 
@@ -165,6 +196,16 @@ class RobotController:
             showvalue=True,
             highlightthickness=0,
         ).grid(row=2, column=1, columnspan=2, sticky="w")
+
+        face = ttk.LabelFrame(outer, text="屏幕与扬声器", padding=8)
+        face.pack(fill="x", pady=(10, 0))
+        ttk.Label(face, text="事件").grid(row=0, column=0, padx=4)
+        ttk.Combobox(face, textvariable=self.face_event_name, values=FACE_EVENTS, state="readonly", width=22).grid(
+            row=0, column=1, padx=4
+        )
+        self.face_send_button = ttk.Button(face, text="发送", command=self._queue_face_event, state="disabled")
+        self.face_send_button.grid(row=0, column=2, padx=4)
+        ttk.Label(face, textvariable=self.face_event_status).grid(row=0, column=3, padx=12, sticky="w")
 
         servos = ttk.LabelFrame(outer, text="STS3215 遥测", padding=8)
         servos.pack(fill="x", pady=(10, 0))
@@ -243,6 +284,9 @@ class RobotController:
         self.telemetry = None
         self.sequence_synced = False
         self.pending_flags |= FLAG_DISARM
+        self.pending_face_event = None
+        self.face_send_button.configure(state="disabled")
+        self.face_event_status.set("等待遥测同步")
         self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self.reader_thread.start()
         self.connection_text.set("已连接")
@@ -264,6 +308,10 @@ class RobotController:
             except Exception:
                 pass
         self.port = None
+        self.sequence_synced = False
+        self.pending_face_event = None
+        self.face_send_button.configure(state="disabled")
+        self.face_event_status.set("等待连接")
         self.connection_text.set("未连接")
         self.connect_button.configure(text="连接")
 
@@ -316,6 +364,20 @@ class RobotController:
     def _pulse_flag(self, flag: int) -> None:
         self.pending_flags |= flag
 
+    def _queue_face_event(self) -> None:
+        try:
+            code = FACE_EVENTS.index(self.face_event_name.get())
+        except ValueError:
+            return
+        self._queue_face_event_code(code)
+
+    def _queue_face_event_code(self, code: int) -> None:
+        if self.port is None or not self.sequence_synced:
+            self.face_event_status.set("串口未连接或序号未同步")
+            return
+        self.pending_face_event = code
+        self.face_event_status.set(f"0x{code:02X} 已排队")
+
     def _key_down(self, event: tk.Event) -> None:
         key = event.keysym.lower()
         if key == "return":
@@ -356,15 +418,26 @@ class RobotController:
             lift = float(self.joystick.get_button(int(buttons["right_shoulder"]))) - float(
                 self.joystick.get_button(int(buttons["left_shoulder"]))
             )
-            for name, flag in (("start", FLAG_ARM), ("stop", FLAG_DISARM)):
+            for name in ("start", "stop"):
                 number = int(buttons[name])
                 pressed = bool(self.joystick.get_button(number))
-                if pressed and not self.gamepad_previous.get(number, False):
+                if pressed and not self.gamepad_previous.get(name, False):
                     if name == "start":
                         self.toggle_arm()
                     else:
                         self.stop_now()
-                self.gamepad_previous[number] = pressed
+                self.gamepad_previous[name] = pressed
+            for name, code in (
+                ("face_startup", 0x01),
+                ("face_charge_start", 0x06),
+                ("face_charge_complete", 0x07),
+                ("face_safe_dock", 0x0A),
+            ):
+                number = int(buttons[name])
+                pressed = bool(self.joystick.get_button(number))
+                if pressed and not self.gamepad_previous.get(name, False):
+                    self._queue_face_event_code(code)
+                self.gamepad_previous[name] = pressed
             return vx, vy, omega, lift
         except (IndexError, pygame.error):
             self.joystick = None
@@ -399,6 +472,7 @@ class RobotController:
             self.tx_epoch = time.monotonic()
             self.tx_cycle = 0
             self.tx_next_slot = 0
+            self.face_send_button.configure(state="normal")
         self.telemetry = telemetry
         self.connection_text.set("已连接，收到遥测")
         self.state_text.set(telemetry.state_name)
@@ -418,7 +492,7 @@ class RobotController:
                 f"{servo.fault_text}"
             )
 
-    def _control_slot_due(self, now: float) -> bool:
+    def _control_slot_due(self, now: float) -> int | None:
         elapsed = max(0.0, now - self.tx_epoch)
         cycle = int(elapsed / CONTROL_SUPERFRAME_S)
         if cycle != self.tx_cycle:
@@ -427,12 +501,13 @@ class RobotController:
 
         cycle_elapsed = elapsed - cycle * CONTROL_SUPERFRAME_S
         if self.tx_next_slot >= len(CONTROL_TX_OFFSETS_S):
-            return False
+            return None
         if cycle_elapsed < CONTROL_TX_OFFSETS_S[self.tx_next_slot]:
-            return False
+            return None
 
+        slot = self.tx_next_slot
         self.tx_next_slot += 1
-        return True
+        return slot
 
     def _tick(self) -> None:
         try:
@@ -452,11 +527,18 @@ class RobotController:
         if self.port is not None:
             if self.telemetry is None and (time.monotonic() - self.connected_at) >= 1.0:
                 self.connection_text.set("已连接，但未收到遥测")
-            if self.sequence_synced and self._control_slot_due(now):
+            slot = self._control_slot_due(now) if self.sequence_synced else None
+            if slot is not None:
                 motion = self._motion() if self.window_active else (0, 0, 0, 0)
-                flags = self.pending_flags
-                if self._write(encode_control(self._next_sequence(), *motion, flags)):
-                    self.pending_flags = 0
+                if slot == 1 and self.pending_flags == 0 and self.pending_face_event is not None:
+                    code = self.pending_face_event
+                    if self._write(encode_face_event(self._next_sequence(), code)):
+                        self.pending_face_event = None
+                        self.face_event_status.set(f"0x{code:02X} 已发送至 RA8P1")
+                else:
+                    flags = self.pending_flags
+                    if self._write(encode_control(self._next_sequence(), *motion, flags)):
+                        self.pending_flags = 0
         self.root.after(UI_TICK_MS, self._tick)
 
     def close(self) -> None:

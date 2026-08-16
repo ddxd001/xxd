@@ -4,6 +4,7 @@ import unittest
 from protocol import (
     MSG_CONFIG,
     MSG_CONTROL,
+    MSG_FACE_EVENT,
     MSG_TELEMETRY,
     STATE_NAMES,
     FrameParser,
@@ -11,6 +12,7 @@ from protocol import (
     crc16_ccitt,
     decode_telemetry,
     encode_control,
+    encode_face_event,
     encode_frame,
 )
 
@@ -37,6 +39,17 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(STATE_NAMES[2], "未使能/零点有效")
         self.assertIn("保留", STATE_NAMES[1])
         self.assertIn("保留", STATE_NAMES[5])
+
+    def test_face_event_is_one_byte_and_sequence_wraps(self) -> None:
+        frame = FrameParser().feed(encode_face_event(0x10000, 0x0A))[0]
+        self.assertEqual(frame.message_type, MSG_FACE_EVENT)
+        self.assertEqual(frame.sequence, 0)
+        self.assertEqual(frame.payload, b"\x0A")
+
+    def test_face_event_rejects_invalid_codes(self) -> None:
+        for code in (-1, 0x0B, 256):
+            with self.subTest(code=code), self.assertRaises(ValueError):
+                encode_face_event(1, code)
 
     def test_temperature_status_bit_is_labeled_diagnostic_only(self) -> None:
         diagnostic = ServoTelemetry(True, 0, 0x04, 40, 70, 12.0, 0, 0, 0)

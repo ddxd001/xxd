@@ -11,9 +11,10 @@
 
 typedef enum e_robot_message_type
 {
-    ROBOT_MSG_CONTROL   = 0x01,
-    ROBOT_MSG_CONFIG    = 0x02, /* Reserved by protocol v3; firmware ignores it. */
-    ROBOT_MSG_TELEMETRY = 0x81
+    ROBOT_MSG_CONTROL    = 0x01,
+    ROBOT_MSG_CONFIG     = 0x02, /* Reserved by protocol v3; firmware ignores it. */
+    ROBOT_MSG_FACE_EVENT = 0x03,
+    ROBOT_MSG_TELEMETRY  = 0x81
 } robot_message_type_t;
 
 enum

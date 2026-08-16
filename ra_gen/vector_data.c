@@ -12,8 +12,12 @@
             [5] = sci_b_uart_txi_isr, /* SCI8 TXI (Transmit data empty) */
             [6] = sci_b_uart_tei_isr, /* SCI8 TEI (Transmit end) */
             [7] = sci_b_uart_eri_isr, /* SCI8 ERI (Receive error) */
-            [8] = r_icu_isr, /* ICU IRQ26 (External pin interrupt 26) */
-            [9] = gpt_counter_overflow_isr, /* GPT0 COUNTER OVERFLOW (Overflow) */
+            [8] = sci_b_uart_rxi_isr, /* SCI1 RXI (Receive data full) */
+            [9] = sci_b_uart_txi_isr, /* SCI1 TXI (Transmit data empty) */
+            [10] = sci_b_uart_tei_isr, /* SCI1 TEI (Transmit end) */
+            [11] = sci_b_uart_eri_isr, /* SCI1 ERI (Receive error) */
+            [12] = r_icu_isr, /* ICU IRQ26 (External pin interrupt 26) */
+            [13] = gpt_counter_overflow_isr, /* GPT0 COUNTER OVERFLOW (Overflow) */
         };
         #if BSP_FEATURE_ICU_HAS_IELSR
         const bsp_interrupt_event_t g_interrupt_event_link_select[BSP_ICU_VECTOR_NUM_ENTRIES] =
@@ -26,8 +30,12 @@
             [5] = BSP_PRV_VECT_ENUM(EVENT_SCI8_TXI,GROUP5), /* SCI8 TXI (Transmit data empty) */
             [6] = BSP_PRV_VECT_ENUM(EVENT_SCI8_TEI,GROUP6), /* SCI8 TEI (Transmit end) */
             [7] = BSP_PRV_VECT_ENUM(EVENT_SCI8_ERI,GROUP7), /* SCI8 ERI (Receive error) */
-            [8] = BSP_PRV_VECT_ENUM(EVENT_ICU_IRQ26,GROUP0), /* ICU IRQ26 (External pin interrupt 26) */
-            [9] = BSP_PRV_VECT_ENUM(EVENT_GPT0_COUNTER_OVERFLOW,GROUP1), /* GPT0 COUNTER OVERFLOW (Overflow) */
+            [8] = BSP_PRV_VECT_ENUM(EVENT_SCI1_RXI,GROUP0), /* SCI1 RXI (Receive data full) */
+            [9] = BSP_PRV_VECT_ENUM(EVENT_SCI1_TXI,GROUP1), /* SCI1 TXI (Transmit data empty) */
+            [10] = BSP_PRV_VECT_ENUM(EVENT_SCI1_TEI,GROUP2), /* SCI1 TEI (Transmit end) */
+            [11] = BSP_PRV_VECT_ENUM(EVENT_SCI1_ERI,GROUP3), /* SCI1 ERI (Receive error) */
+            [12] = BSP_PRV_VECT_ENUM(EVENT_ICU_IRQ26,GROUP4), /* ICU IRQ26 (External pin interrupt 26) */
+            [13] = BSP_PRV_VECT_ENUM(EVENT_GPT0_COUNTER_OVERFLOW,GROUP5), /* GPT0 COUNTER OVERFLOW (Overflow) */
         };
         #endif
         #endif

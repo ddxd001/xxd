@@ -13,6 +13,10 @@
     "left_shoulder": 4,
     "right_shoulder": 5,
     "start": 7,
-    "stop": 1
+    "stop": 1,
+    "face_startup": 2,
+    "face_charge_start": 3,
+    "face_charge_complete": 0,
+    "face_safe_dock": 1
   }
 }

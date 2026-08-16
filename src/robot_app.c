@@ -9,9 +9,11 @@
 #include "robot_protocol.h"
 #include "sts3215.h"
 
-#define LORA_RX_RING_SIZE       (256U)
-#define CONTROL_PAYLOAD_LENGTH  (10U)
-#define TELEMETRY_PAYLOAD_SIZE  (85U)
+#define LORA_RX_RING_SIZE         (256U)
+#define CONTROL_PAYLOAD_LENGTH    (10U)
+#define FACE_EVENT_PAYLOAD_LENGTH (1U)
+#define FACE_EVENT_MAX            (0x0AU)
+#define TELEMETRY_PAYLOAD_SIZE    (85U)
 
 typedef struct st_robot_command
 {
@@ -43,6 +45,8 @@ typedef struct st_robot_runtime
     uint32_t      last_telemetry_tick;
     uint16_t      last_control_sequence;
     bool          control_sequence_valid;
+    uint16_t      last_face_event_sequence;
+    bool          face_event_sequence_valid;
     bool          control_received;
     uint16_t      telemetry_sequence;
     uint32_t      recovery_started_ms;
@@ -72,6 +76,11 @@ static volatile bool g_lora_tx_busy;
 static bool g_lora_open;
 static uint8_t g_lora_tx_buffer[ROBOT_PROTOCOL_MAX_FRAME];
 static robot_parser_t g_lora_parser;
+static bool g_linux_uart_open;
+static volatile bool g_linux_uart_tx_busy;
+static bool g_linux_event_pending;
+static uint8_t g_linux_pending_event;
+static uint8_t g_linux_tx_byte;
 
 static int16_t clamp_command (int16_t value)
 {
@@ -281,6 +290,29 @@ static void handle_control_frame (robot_frame_t const * frame, uint32_t now_ms)
     }
 }
 
+static void handle_face_event_frame (robot_frame_t const * frame)
+{
+    if ((FACE_EVENT_PAYLOAD_LENGTH != frame->length) || (frame->payload[0] > FACE_EVENT_MAX))
+    {
+        return;
+    }
+    if (g_robot.face_event_sequence_valid && !sequence_is_newer(frame->sequence, g_robot.last_face_event_sequence))
+    {
+        return;
+    }
+
+    g_robot.face_event_sequence_valid = true;
+    g_robot.last_face_event_sequence = frame->sequence;
+
+    /* A single pending slot intentionally collapses a burst to its latest
+     * event, matching the Linux receiver's "last valid byte wins" rule. */
+    if (g_linux_uart_open)
+    {
+        g_linux_pending_event = frame->payload[0];
+        g_linux_event_pending = true;
+    }
+}
+
 static void consume_lora (uint32_t now_ms)
 {
     robot_frame_t frame;
@@ -294,11 +326,32 @@ static void consume_lora (uint32_t now_ms)
             {
                 handle_control_frame(&frame, now_ms);
             }
+            else if (ROBOT_MSG_FACE_EVENT == frame.type)
+            {
+                handle_face_event_frame(&frame);
+            }
             else
             {
                 /* CONFIG and unsupported messages are intentionally ignored. */
             }
         }
+    }
+}
+
+static void service_linux_uart (void)
+{
+    if (!g_linux_uart_open || g_linux_uart_tx_busy || !g_linux_event_pending)
+    {
+        return;
+    }
+
+    g_linux_tx_byte = g_linux_pending_event;
+    g_linux_event_pending = false;
+    g_linux_uart_tx_busy = true;
+    if (FSP_SUCCESS != g_linux_uart.p_api->write(g_linux_uart.p_ctrl, &g_linux_tx_byte, 1U))
+    {
+        /* Do not retry: replaying an event restarts its face/audio sequence. */
+        g_linux_uart_tx_busy = false;
     }
 }
 
@@ -671,6 +724,12 @@ bool robot_app_init (void)
         ok = false;
     }
 
+    /* Screen/audio output is optional and must never prevent robot startup. */
+    if (FSP_SUCCESS == g_linux_uart.p_api->open(g_linux_uart.p_ctrl, g_linux_uart.p_cfg))
+    {
+        g_linux_uart_open = true;
+    }
+
     if ((FSP_SUCCESS != g_system_tick.p_api->open(g_system_tick.p_ctrl, g_system_tick.p_cfg)) ||
         (FSP_SUCCESS != g_system_tick.p_api->start(g_system_tick.p_ctrl)))
     {
@@ -687,6 +746,7 @@ void robot_app_process (void)
 {
     uint32_t const now_ms = robot_app_millis();
     consume_lora(now_ms);
+    service_linux_uart();
 
     if ((uint32_t) (now_ms - g_robot.last_control_tick) >= ROBOT_CONTROL_PERIOD_MS)
     {
@@ -754,5 +814,13 @@ void lora_uart_callback (uart_callback_args_t * p_args)
     else
     {
         g_lora_tx_busy = false;
+    }
+}
+
+void linux_uart_callback (uart_callback_args_t * p_args)
+{
+    if (UART_EVENT_TX_COMPLETE == p_args->event)
+    {
+        g_linux_uart_tx_busy = false;
     }
 }
