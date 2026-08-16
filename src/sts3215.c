@@ -426,12 +426,13 @@ bool sts3215_any_serious_fault (void)
 bool sts3215_any_hard_fault (void)
 {
     uint8_t const recoverable_mask = STS3215_STATUS_VOLTAGE | STS3215_STATUS_CURRENT | STS3215_STATUS_OVERLOAD;
+    uint8_t const hard_status_mask = (uint8_t) ~(recoverable_mask | STS3215_STATUS_TEMPERATURE);
     for (uint8_t i = 0U; i < STS3215_SERVO_COUNT; i++)
     {
         sts3215_status_t const * status = &g_sts.status[i];
         uint8_t const flags = (uint8_t) (status->protocol_error | status->status_flags);
         if (status->online && ((status->temperature_c >= ROBOT_SERVO_FAULT_TEMP_C) ||
-                              (0U != (flags & (uint8_t) ~recoverable_mask))))
+                              (0U != (flags & hard_status_mask))))
         {
             return true;
         }

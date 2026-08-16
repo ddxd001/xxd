@@ -324,13 +324,8 @@ function boot() {
       spin.rotation.z += rate * dt;
     });
 
-    // lift platform: follow real position when known, else integrate R/F input
-    let target01 = liftNorm;
-    if (tel && tel.upper_limit > 0) {
-      target01 = Math.max(0, Math.min(1, tel.lift_position / tel.upper_limit));
-    } else {
-      target01 = Math.max(0, Math.min(1, liftNorm + motion.lift * 0.5 * dt));
-    }
+    // The firmware has no upper range, so this is input-driven visualization only.
+    const target01 = Math.max(0, Math.min(1, liftNorm + motion.lift * 0.5 * dt));
     liftNorm += (target01 - liftNorm) * Math.min(1, dt * 10);
     liftGroup.position.y = LIFT_REST + liftNorm * LIFT_TRAVEL; // platform rides on top of the column
 

@@ -2,12 +2,17 @@ import struct
 import unittest
 
 from protocol import (
+    MSG_CONFIG,
     MSG_CONTROL,
+    MSG_FACE_EVENT,
     MSG_TELEMETRY,
+    STATE_NAMES,
     FrameParser,
+    ServoTelemetry,
     crc16_ccitt,
     decode_telemetry,
     encode_control,
+    encode_face_event,
     encode_frame,
 )
 
@@ -26,6 +31,33 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(frames[0].message_type, MSG_CONTROL)
         self.assertEqual(frames[0].sequence, 7)
         self.assertEqual(struct.unpack("<hhhhH", frames[0].payload), (1000, -1000, 123, -456, 3))
+        self.assertEqual(frames[1].message_type, MSG_CONFIG)
+        self.assertEqual(struct.unpack("<i", frames[1].payload), (123456,))
+
+    def test_lift_zero_state_names(self) -> None:
+        self.assertEqual(STATE_NAMES[0], "未使能/零点无效")
+        self.assertEqual(STATE_NAMES[2], "未使能/零点有效")
+        self.assertIn("保留", STATE_NAMES[1])
+        self.assertIn("保留", STATE_NAMES[5])
+
+    def test_face_event_is_one_byte_and_sequence_wraps(self) -> None:
+        frame = FrameParser().feed(encode_face_event(0x10000, 0x0A))[0]
+        self.assertEqual(frame.message_type, MSG_FACE_EVENT)
+        self.assertEqual(frame.sequence, 0)
+        self.assertEqual(frame.payload, b"\x0A")
+
+    def test_face_event_rejects_invalid_codes(self) -> None:
+        for code in (-1, 0x0B, 256):
+            with self.subTest(code=code), self.assertRaises(ValueError):
+                encode_face_event(1, code)
+
+    def test_temperature_status_bit_is_labeled_diagnostic_only(self) -> None:
+        diagnostic = ServoTelemetry(True, 0, 0x04, 40, 70, 12.0, 0, 0, 0)
+        measured_hot = ServoTelemetry(True, 0, 0, 70, 70, 12.0, 0, 0, 0)
+
+        self.assertIn("仅诊断", diagnostic.fault_text)
+        self.assertNotIn("实测过温", diagnostic.fault_text)
+        self.assertIn("实测过温", measured_hot.fault_text)
 
     def test_bad_crc_is_rejected_and_parser_recovers(self) -> None:
         damaged = bytearray(encode_control(1, 1, 2, 3, 4))
@@ -63,6 +95,7 @@ class ProtocolTests(unittest.TestCase):
         telemetry = decode_telemetry(parsed.payload)
         self.assertEqual(telemetry.state, 3)
         self.assertEqual(telemetry.lift_position, 4097)
+        self.assertEqual(telemetry.upper_limit, 12000)
         self.assertEqual(telemetry.wheel_speed, (10, -20, 30))
         self.assertTrue(all(servo.online for servo in telemetry.servos))
         self.assertEqual(telemetry.servos[0].status_flags, 0x20)

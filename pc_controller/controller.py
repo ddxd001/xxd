@@ -24,27 +24,34 @@ except ImportError:
 
 from protocol import (
     FLAG_ARM,
-    FLAG_CALIBRATE,
     FLAG_CLEAR_FAULT,
     FLAG_DISARM,
-    FLAG_HOME,
     MSG_TELEMETRY,
     FrameParser,
     Telemetry,
     decode_telemetry,
-    encode_config,
     encode_control,
+    encode_face_event,
 )
 
 CONFIG_PATH = Path(__file__).with_name("controller_config.json")
 DEFAULT_CONFIG = {
     "com_port": "",
     "baud": 115200,
-    "upper_limit_counts": 0,
     "speed_scale": 0.20,
+    "lift_speed_scale": 0.60,
     "gamepad_deadzone": 0.12,
     "gamepad_axes": {"left_x": 0, "left_y": 1, "right_x": 2},
-    "gamepad_buttons": {"left_shoulder": 4, "right_shoulder": 5, "start": 7, "stop": 1},
+    "gamepad_buttons": {
+        "left_shoulder": 4,
+        "right_shoulder": 5,
+        "start": 7,
+        "stop": 1,
+        "face_startup": 2,
+        "face_charge_start": 3,
+        "face_charge_complete": 0,
+        "face_safe_dock": 1,
+    },
 }
 
 # ATK-MWCC68D is half duplex. Two control slots are aligned from the
@@ -53,6 +60,20 @@ DEFAULT_CONFIG = {
 CONTROL_SUPERFRAME_S = 0.200
 CONTROL_TX_OFFSETS_S = (0.020, 0.070)
 UI_TICK_MS = 5
+
+FACE_EVENTS = (
+    "00 待机",
+    "01 启动",
+    "02 欢迎回家",
+    "03 机器人移动中",
+    "04 请缓慢移动",
+    "05 请停止",
+    "06 开始充电",
+    "07 充电完成",
+    "08 检测到儿童",
+    "09 任务完成",
+    "0A 安全停靠",
+)
 
 
 class RobotController:
@@ -67,13 +88,13 @@ class RobotController:
         self.connected_at = 0.0
         self.sequence = 0
         self.sequence_synced = False
-        self.pending_config = False
         self.telemetry: Telemetry | None = None
         self.keys: set[str] = set()
         self.pending_flags = FLAG_DISARM
+        self.pending_face_event: int | None = None
         self.window_active = True
         self.joystick = None
-        self.gamepad_previous: dict[int, bool] = {}
+        self.gamepad_previous: dict[str, bool] = {}
         self.port_info = {}
         self.tx_epoch = time.monotonic()
         self.tx_cycle = 0
@@ -81,6 +102,7 @@ class RobotController:
 
         self.port_name = tk.StringVar(value=self.config["com_port"])
         self.speed_percent = tk.DoubleVar(value=float(self.config["speed_scale"]) * 100.0)
+        self.lift_speed_percent = tk.DoubleVar(value=float(self.config["lift_speed_scale"]) * 100.0)
         self.deadzone = tk.DoubleVar(value=float(self.config["gamepad_deadzone"]))
         self.connection_text = tk.StringVar(value="未连接")
         self.state_text = tk.StringVar(value="等待遥测")
@@ -88,7 +110,8 @@ class RobotController:
         self.link_text = tk.StringVar(value="--")
         self.lift_text = tk.StringVar(value="--")
         self.trigger_text = tk.StringVar(value="无")
-        self.upper_text = tk.StringVar(value=str(self.config["upper_limit_counts"]))
+        self.face_event_name = tk.StringVar(value=FACE_EVENTS[0])
+        self.face_event_status = tk.StringVar(value="等待连接")
         self.servo_text = [tk.StringVar(value=f"ID{i + 1}: --") for i in range(4)]
 
         self._build_ui()
@@ -103,7 +126,11 @@ class RobotController:
             try:
                 saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
                 for key, value in saved.items():
-                    if key in config:
+                    if key not in config:
+                        continue
+                    if isinstance(config[key], dict) and isinstance(value, dict):
+                        config[key].update(value)
+                    else:
                         config[key] = value
             except (OSError, ValueError):
                 pass
@@ -112,13 +139,14 @@ class RobotController:
     def _save_config(self) -> None:
         self.config["com_port"] = self.port_name.get()
         self.config["speed_scale"] = self.speed_percent.get() / 100.0
+        self.config["lift_speed_scale"] = self.lift_speed_percent.get() / 100.0
         self.config["gamepad_deadzone"] = self.deadzone.get()
         CONFIG_PATH.write_text(json.dumps(self.config, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _build_ui(self) -> None:
         self.root.title("RA8P1 全向底盘控制器")
-        self.root.geometry("720x565")
-        self.root.minsize(680, 525)
+        self.root.geometry("720x650")
+        self.root.minsize(680, 610)
         outer = ttk.Frame(self.root, padding=12)
         outer.pack(fill="both", expand=True)
 
@@ -145,30 +173,49 @@ class RobotController:
             ttk.Label(status, text=f"{name}：", width=8).grid(row=row, column=0, sticky="e")
             ttk.Label(status, textvariable=variable).grid(row=row, column=1, sticky="w")
 
-        controls = ttk.LabelFrame(outer, text="控制与标定", padding=8)
+        controls = ttk.LabelFrame(outer, text="控制", padding=8)
         controls.pack(fill="x", pady=(10, 0))
         ttk.Button(controls, text="切换使能 (Enter)", command=self.toggle_arm).grid(row=0, column=0, padx=4, pady=4)
         ttk.Button(controls, text="立即停用 (Space)", command=self.stop_now).grid(row=0, column=1, padx=4, pady=4)
         ttk.Button(controls, text="清除故障", command=lambda: self._pulse_flag(FLAG_CLEAR_FAULT)).grid(row=0, column=2, padx=4)
-        ttk.Button(controls, text="回零…", command=self.request_home).grid(row=0, column=3, padx=4)
-        ttk.Button(controls, text="捕获当前为软上限", command=self.capture_upper_limit).grid(row=0, column=4, padx=4)
-        ttk.Label(controls, text="速度比例").grid(row=1, column=0, sticky="e")
+        ttk.Label(controls, text="底盘速度").grid(row=1, column=0, sticky="e")
         ttk.Scale(controls, from_=5, to=100, variable=self.speed_percent, orient="horizontal", length=180).grid(
             row=1, column=1, columnspan=2, sticky="w"
         )
         ttk.Label(controls, text="手柄死区").grid(row=1, column=3, sticky="e")
         ttk.Entry(controls, textvariable=self.deadzone, width=7).grid(row=1, column=4, sticky="w")
-        ttk.Label(controls, text="软上限：").grid(row=2, column=0, sticky="e")
-        ttk.Label(controls, textvariable=self.upper_text).grid(row=2, column=1, sticky="w")
-        ttk.Button(controls, text="发送软上限", command=self.send_upper_limit).grid(row=2, column=2, padx=4)
-        ttk.Button(controls, text="开始上限标定…", command=self.request_calibration).grid(row=2, column=3, padx=4)
+        ttk.Label(controls, text="升降速度").grid(row=2, column=0, sticky="e")
+        tk.Scale(
+            controls,
+            from_=10,
+            to=100,
+            resolution=5,
+            variable=self.lift_speed_percent,
+            orient="horizontal",
+            length=180,
+            showvalue=True,
+            highlightthickness=0,
+        ).grid(row=2, column=1, columnspan=2, sticky="w")
+
+        face = ttk.LabelFrame(outer, text="屏幕与扬声器", padding=8)
+        face.pack(fill="x", pady=(10, 0))
+        ttk.Label(face, text="事件").grid(row=0, column=0, padx=4)
+        ttk.Combobox(face, textvariable=self.face_event_name, values=FACE_EVENTS, state="readonly", width=22).grid(
+            row=0, column=1, padx=4
+        )
+        self.face_send_button = ttk.Button(face, text="发送", command=self._queue_face_event, state="disabled")
+        self.face_send_button.grid(row=0, column=2, padx=4)
+        ttk.Label(face, textvariable=self.face_event_status).grid(row=0, column=3, padx=12, sticky="w")
 
         servos = ttk.LabelFrame(outer, text="STS3215 遥测", padding=8)
         servos.pack(fill="x", pady=(10, 0))
         for index, variable in enumerate(self.servo_text):
             ttk.Label(servos, textvariable=variable).grid(row=index, column=0, sticky="w")
 
-        help_text = "键盘：W/S 前后，A/D 左右，Q/E 旋转，R/F 升降。失焦、手柄断开、串口关闭时自动停用。"
+        help_text = (
+            "键盘：W/S 前后，A/D 左右，Q/E 旋转，R/F 升降。"
+            "升降无上端限位，每次上电前必须人工放到最低位；失焦、手柄断开、串口关闭时自动停用。"
+        )
         ttk.Label(outer, text=help_text, foreground="#555").pack(anchor="w", pady=(10, 0))
 
     def _bind_events(self) -> None:
@@ -236,8 +283,10 @@ class RobotController:
         self.connected_at = time.monotonic()
         self.telemetry = None
         self.sequence_synced = False
-        self.pending_config = True
         self.pending_flags |= FLAG_DISARM
+        self.pending_face_event = None
+        self.face_send_button.configure(state="disabled")
+        self.face_event_status.set("等待遥测同步")
         self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self.reader_thread.start()
         self.connection_text.set("已连接")
@@ -259,6 +308,10 @@ class RobotController:
             except Exception:
                 pass
         self.port = None
+        self.sequence_synced = False
+        self.pending_face_event = None
+        self.face_send_button.configure(state="disabled")
+        self.face_event_status.set("等待连接")
         self.connection_text.set("未连接")
         self.connect_button.configure(text="连接")
 
@@ -299,45 +352,6 @@ class RobotController:
             self._write(encode_control(self._next_sequence(), 0, 0, 0, 0, FLAG_DISARM))
             time.sleep(0.05)
 
-    def send_upper_limit(self) -> None:
-        value = int(self.config.get("upper_limit_counts", 0))
-        self.upper_text.set(str(value))
-        if self.port is not None and self.port.is_open:
-            self.pending_config = True
-
-    def capture_upper_limit(self) -> None:
-        if self.telemetry is None or self.telemetry.state != 5 or not self.telemetry.homed:
-            messagebox.showwarning("不能捕获", "必须先完成回零并进入上限标定状态。")
-            return
-        if self.telemetry.lift_position <= 0:
-            messagebox.showwarning("不能捕获", "当前位置必须大于零。")
-            return
-        if not messagebox.askyesno("确认软上限", f"将当前位置 {self.telemetry.lift_position} 保存为软上限？"):
-            return
-        self.config["upper_limit_counts"] = self.telemetry.lift_position
-        self._save_config()
-        self.send_upper_limit()
-
-    def request_home(self) -> None:
-        if messagebox.askyesno("确认回零", "确认底盘已架空、升降下方无人和障碍物，并开始向下回零？"):
-            self._pulse_flag(FLAG_HOME)
-
-    def request_calibration(self) -> None:
-        if self.telemetry is None or self.telemetry.state != 2 or not self.telemetry.homed:
-            messagebox.showwarning("不能标定", "必须先完成回零，并保持整机未使能。")
-            return
-        if self.telemetry.fault_bits:
-            messagebox.showwarning("不能标定", "请先排除并清除故障。")
-            return
-        if self.telemetry.upper_limit > 0:
-            messagebox.showwarning("不能标定", "软上限已经有效；首版固件不允许在线覆盖标定。")
-            return
-        if messagebox.askyesno(
-            "确认上限标定",
-            "标定期间底盘保持停用，只允许按 R 低速上升。请确认升降空载、上方无人且随时准备按 Space 停止。",
-        ):
-            self._pulse_flag(FLAG_CALIBRATE)
-
     def toggle_arm(self) -> None:
         active = self.telemetry is not None and self.telemetry.state in (1, 3, 5, 6)
         self._pulse_flag(FLAG_DISARM if active else FLAG_ARM)
@@ -349,6 +363,20 @@ class RobotController:
 
     def _pulse_flag(self, flag: int) -> None:
         self.pending_flags |= flag
+
+    def _queue_face_event(self) -> None:
+        try:
+            code = FACE_EVENTS.index(self.face_event_name.get())
+        except ValueError:
+            return
+        self._queue_face_event_code(code)
+
+    def _queue_face_event_code(self, code: int) -> None:
+        if self.port is None or not self.sequence_synced:
+            self.face_event_status.set("串口未连接或序号未同步")
+            return
+        self.pending_face_event = code
+        self.face_event_status.set(f"0x{code:02X} 已排队")
 
     def _key_down(self, event: tk.Event) -> None:
         key = event.keysym.lower()
@@ -390,15 +418,26 @@ class RobotController:
             lift = float(self.joystick.get_button(int(buttons["right_shoulder"]))) - float(
                 self.joystick.get_button(int(buttons["left_shoulder"]))
             )
-            for name, flag in (("start", FLAG_ARM), ("stop", FLAG_DISARM)):
+            for name in ("start", "stop"):
                 number = int(buttons[name])
                 pressed = bool(self.joystick.get_button(number))
-                if pressed and not self.gamepad_previous.get(number, False):
+                if pressed and not self.gamepad_previous.get(name, False):
                     if name == "start":
                         self.toggle_arm()
                     else:
                         self.stop_now()
-                self.gamepad_previous[number] = pressed
+                self.gamepad_previous[name] = pressed
+            for name, code in (
+                ("face_startup", 0x01),
+                ("face_charge_start", 0x06),
+                ("face_charge_complete", 0x07),
+                ("face_safe_dock", 0x0A),
+            ):
+                number = int(buttons[name])
+                pressed = bool(self.joystick.get_button(number))
+                if pressed and not self.gamepad_previous.get(name, False):
+                    self._queue_face_event_code(code)
+                self.gamepad_previous[name] = pressed
             return vx, vy, omega, lift
         except (IndexError, pygame.error):
             self.joystick = None
@@ -412,8 +451,14 @@ class RobotController:
         lift = float("r" in self.keys) - float("f" in self.keys)
         gx, gy, go, gl = self._gamepad_motion()
         vx, vy, omega, lift = (max(-1.0, min(1.0, a + b)) for a, b in ((vx, gx), (vy, gy), (omega, go), (lift, gl)))
-        scale = max(0.05, min(1.0, self.speed_percent.get() / 100.0))
-        return tuple(int(round(value * scale * 1000.0)) for value in (vx, vy, omega, lift))
+        chassis_scale = max(0.05, min(1.0, self.speed_percent.get() / 100.0))
+        lift_scale = max(0.10, min(1.0, self.lift_speed_percent.get() / 100.0))
+        return (
+            int(round(vx * chassis_scale * 1000.0)),
+            int(round(vy * chassis_scale * 1000.0)),
+            int(round(omega * chassis_scale * 1000.0)),
+            int(round(lift * lift_scale * 1000.0)),
+        )
 
     def _update_telemetry(self, telemetry: Telemetry) -> None:
         if not self.sequence_synced:
@@ -427,6 +472,7 @@ class RobotController:
             self.tx_epoch = time.monotonic()
             self.tx_cycle = 0
             self.tx_next_slot = 0
+            self.face_send_button.configure(state="normal")
         self.telemetry = telemetry
         self.connection_text.set("已连接，收到遥测")
         self.state_text.set(telemetry.state_name)
@@ -434,8 +480,8 @@ class RobotController:
         self.trigger_text.set(telemetry.fault_snapshot.fault_text)
         self.link_text.set(f"{telemetry.link_age_ms} ms，帧序号 {telemetry.last_control_sequence}")
         self.lift_text.set(
-            f"位置 {telemetry.lift_position} / 目标 {telemetry.lift_target} / 上限 {telemetry.upper_limit}，"
-            f"回零={'是' if telemetry.homed else '否'}，原点={'触发' if telemetry.home_switch else '正常'}"
+            f"位置 {telemetry.lift_position} / 目标 {telemetry.lift_target}，"
+            f"零点={'有效' if telemetry.homed else '无效'}，下限开关=未使用"
         )
         for index, servo in enumerate(telemetry.servos):
             temperature_limit = f"{servo.temperature_limit_c} °C" if servo.temperature_limit_c is not None else "--"
@@ -446,7 +492,7 @@ class RobotController:
                 f"{servo.fault_text}"
             )
 
-    def _control_slot_due(self, now: float) -> bool:
+    def _control_slot_due(self, now: float) -> int | None:
         elapsed = max(0.0, now - self.tx_epoch)
         cycle = int(elapsed / CONTROL_SUPERFRAME_S)
         if cycle != self.tx_cycle:
@@ -455,12 +501,13 @@ class RobotController:
 
         cycle_elapsed = elapsed - cycle * CONTROL_SUPERFRAME_S
         if self.tx_next_slot >= len(CONTROL_TX_OFFSETS_S):
-            return False
+            return None
         if cycle_elapsed < CONTROL_TX_OFFSETS_S[self.tx_next_slot]:
-            return False
+            return None
 
+        slot = self.tx_next_slot
         self.tx_next_slot += 1
-        return True
+        return slot
 
     def _tick(self) -> None:
         try:
@@ -480,13 +527,15 @@ class RobotController:
         if self.port is not None:
             if self.telemetry is None and (time.monotonic() - self.connected_at) >= 1.0:
                 self.connection_text.set("已连接，但未收到遥测")
-            if self.sequence_synced and self._control_slot_due(now):
-                if self.pending_config:
-                    value = int(self.config.get("upper_limit_counts", 0))
-                    if self._write(encode_config(self._next_sequence(), value)):
-                        self.pending_config = False
+            slot = self._control_slot_due(now) if self.sequence_synced else None
+            if slot is not None:
+                motion = self._motion() if self.window_active else (0, 0, 0, 0)
+                if slot == 1 and self.pending_flags == 0 and self.pending_face_event is not None:
+                    code = self.pending_face_event
+                    if self._write(encode_face_event(self._next_sequence(), code)):
+                        self.pending_face_event = None
+                        self.face_event_status.set(f"0x{code:02X} 已发送至 RA8P1")
                 else:
-                    motion = self._motion() if self.window_active else (0, 0, 0, 0)
                     flags = self.pending_flags
                     if self._write(encode_control(self._next_sequence(), *motion, flags)):
                         self.pending_flags = 0

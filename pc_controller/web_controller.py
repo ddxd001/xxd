@@ -31,16 +31,14 @@ from aiohttp import web
 from protocol import (
     FAULT_NAMES,
     FLAG_ARM,
-    FLAG_CALIBRATE,
     FLAG_CLEAR_FAULT,
     FLAG_DISARM,
-    FLAG_HOME,
     MSG_TELEMETRY,
     FrameParser,
     Telemetry,
     decode_telemetry,
-    encode_config,
     encode_control,
+    encode_face_event,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -50,11 +48,20 @@ INDEX_PATH = BASE_DIR / "web" / "index.html"
 DEFAULT_CONFIG = {
     "com_port": "",
     "baud": 115200,
-    "upper_limit_counts": 0,
     "speed_scale": 0.20,
+    "lift_speed_scale": 0.60,
     "gamepad_deadzone": 0.12,
     "gamepad_axes": {"left_x": 0, "left_y": 1, "right_x": 2},
-    "gamepad_buttons": {"left_shoulder": 4, "right_shoulder": 5, "start": 7, "stop": 1},
+    "gamepad_buttons": {
+        "left_shoulder": 4,
+        "right_shoulder": 5,
+        "start": 7,
+        "stop": 1,
+        "face_startup": 2,
+        "face_charge_start": 3,
+        "face_charge_complete": 0,
+        "face_safe_dock": 1,
+    },
 }
 
 # ATK-MWCC68D is half duplex. Two control slots are aligned from the
@@ -150,7 +157,11 @@ def load_config() -> dict:
         try:
             saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             for key, value in saved.items():
-                if key in config:
+                if key not in config:
+                    continue
+                if isinstance(config[key], dict) and isinstance(value, dict):
+                    config[key].update(value)
+                else:
                     config[key] = value
         except (OSError, ValueError):
             pass
@@ -219,8 +230,8 @@ class RobotBackend:
         self.connected_at = 0.0
         self.sequence = 0
         self.sequence_synced = False
-        self.pending_config = False
         self.pending_flags = FLAG_DISARM
+        self.pending_face_event: int | None = None
         self.telemetry: Telemetry | None = None
         self.last_telemetry_at = 0.0
         self.tx_epoch = time.monotonic()
@@ -271,8 +282,8 @@ class RobotBackend:
         self.connected_at = time.monotonic()
         self.telemetry = None
         self.sequence_synced = False
-        self.pending_config = True
         self.pending_flags |= FLAG_DISARM
+        self.pending_face_event = None
         self.motion = (0.0, 0.0, 0.0, 0.0)
         self.serial_error = None
         self.write_failures = 0
@@ -301,6 +312,7 @@ class RobotBackend:
         self.port = None
         self.sequence_synced = False
         self.telemetry = None
+        self.pending_face_event = None
         self.motion = (0.0, 0.0, 0.0, 0.0)
 
     def _reader_loop(self) -> None:
@@ -356,7 +368,7 @@ class RobotBackend:
         self.pending_flags |= FLAG_DISARM
         self._write(encode_control(self._next_sequence(), 0, 0, 0, 0, FLAG_DISARM))
 
-    def _control_slot_due(self, now: float) -> bool:
+    def _control_slot_due(self, now: float) -> int | None:
         elapsed = max(0.0, now - self.tx_epoch)
         cycle = int(elapsed / CONTROL_SUPERFRAME_S)
         if cycle != self.tx_cycle:
@@ -364,16 +376,22 @@ class RobotBackend:
             self.tx_next_slot = 0
         cycle_elapsed = elapsed - cycle * CONTROL_SUPERFRAME_S
         if self.tx_next_slot >= len(CONTROL_TX_OFFSETS_S):
-            return False
+            return None
         if cycle_elapsed < CONTROL_TX_OFFSETS_S[self.tx_next_slot]:
-            return False
+            return None
+        slot = self.tx_next_slot
         self.tx_next_slot += 1
-        return True
+        return slot
 
     def _scaled_motion(self) -> tuple[int, int, int, int]:
-        scale = max(0.05, min(1.0, float(self.config.get("speed_scale", 0.2))))
-        return tuple(
-            int(round(max(-1.0, min(1.0, value)) * scale * 1000.0)) for value in self.motion
+        chassis_scale = max(0.05, min(1.0, float(self.config.get("speed_scale", 0.2))))
+        lift_scale = max(0.10, min(1.0, float(self.config.get("lift_speed_scale", 0.6))))
+        vx, vy, omega, lift = (max(-1.0, min(1.0, value)) for value in self.motion)
+        return (
+            int(round(vx * chassis_scale * 1000.0)),
+            int(round(vy * chassis_scale * 1000.0)),
+            int(round(omega * chassis_scale * 1000.0)),
+            int(round(lift * lift_scale * 1000.0)),
         )
 
     # -------------------------------------------------------------- telemetry
@@ -405,24 +423,23 @@ class RobotBackend:
     def pulse_flag(self, flag: int) -> None:
         self.pending_flags |= flag
 
+    async def queue_face_event(self, code) -> None:
+        if self.port is None or not self.sequence_synced:
+            await self.broadcast({"type": "error", "message": "串口未连接或控制序号尚未同步"})
+            return
+        try:
+            event_code = int(code)
+        except (TypeError, ValueError):
+            event_code = -1
+        if not 0 <= event_code <= 0x0A:
+            await self.broadcast({"type": "error", "message": "无效的屏幕/语音事件"})
+            return
+        self.pending_face_event = event_code
+        await self.broadcast({"type": "face_event_status", "state": "queued", "code": event_code})
+
     def toggle_arm(self) -> None:
         active = self.telemetry is not None and self.telemetry.state in (1, 3, 5, 6)
         self.pulse_flag(FLAG_DISARM if active else FLAG_ARM)
-
-    def capture_upper_limit(self) -> str | None:
-        """Returns an error string, or None on success."""
-        if self.telemetry is None or self.telemetry.state != 5 or not self.telemetry.homed:
-            return "必须先完成回零并进入上限标定状态"
-        if self.telemetry.lift_position <= 0:
-            return "当前位置必须大于零"
-        self.config["upper_limit_counts"] = self.telemetry.lift_position
-        save_config(self.config)
-        self.send_upper_limit()
-        return None
-
-    def send_upper_limit(self) -> None:
-        if self.port is not None and self.port.is_open:
-            self.pending_config = True
 
     # -------------------------------------------------------------- async loops
 
@@ -440,13 +457,15 @@ class RobotBackend:
     async def tx_loop(self) -> None:
         while True:
             now = time.monotonic()
-            if self.port is not None and self.sequence_synced and self._control_slot_due(now):
-                if self.pending_config:
-                    value = int(self.config.get("upper_limit_counts", 0))
-                    if self._write(encode_config(self._next_sequence(), value)):
-                        self.pending_config = False
+            slot = self._control_slot_due(now) if self.port is not None and self.sequence_synced else None
+            if slot is not None:
+                vx, vy, omega, lift = self._scaled_motion()
+                if slot == 1 and self.pending_flags == 0 and self.pending_face_event is not None:
+                    code = self.pending_face_event
+                    if self._write(encode_face_event(self._next_sequence(), code)):
+                        self.pending_face_event = None
+                        await self.broadcast({"type": "face_event_status", "state": "sent", "code": code})
                 else:
-                    vx, vy, omega, lift = self._scaled_motion()
                     flags = self.pending_flags
                     if self._write(encode_control(self._next_sequence(), vx, vy, omega, lift, flags)):
                         self.pending_flags = 0
@@ -511,7 +530,9 @@ class RobotBackend:
         self.last_client_msg_at = time.monotonic()
         kind = message.get("type")
 
-        if kind == "list_ports":
+        if message.get("action") == "face_event":
+            await self.queue_face_event(message.get("code"))
+        elif kind == "list_ports":
             await ws.send_str(json.dumps({"type": "ports", "ports": self.list_ports()}, ensure_ascii=False))
         elif kind == "connect":
             error = self.connect(str(message.get("port", "")))
@@ -524,7 +545,10 @@ class RobotBackend:
         elif kind == "motion":
             self.set_motion(message.get("vx"), message.get("vy"), message.get("omega"), message.get("lift"))
         elif kind == "action":
-            await self.handle_action(str(message.get("name", "")))
+            if str(message.get("name", "")) == "face_event":
+                await self.queue_face_event(message.get("code"))
+            else:
+                await self.handle_action(str(message.get("name", "")))
         elif kind == "safe_stop":
             await self._send_safe_stop(3)
         elif kind == "chat":
@@ -540,26 +564,12 @@ class RobotBackend:
         elif kind == "set_config":
             if "speed_scale" in message:
                 self.config["speed_scale"] = max(0.05, min(1.0, float(message["speed_scale"])))
+            if "lift_speed_scale" in message:
+                self.config["lift_speed_scale"] = max(0.10, min(1.0, float(message["lift_speed_scale"])))
             if "gamepad_deadzone" in message:
                 self.config["gamepad_deadzone"] = max(0.0, min(0.8, float(message["gamepad_deadzone"])))
             save_config(self.config)
             await self.broadcast_config()
-        elif kind == "capture_upper_limit":
-            error = self.capture_upper_limit()
-            if error:
-                await ws.send_str(json.dumps({"type": "error", "message": error}, ensure_ascii=False))
-            await self.broadcast_config()
-        elif kind == "send_upper_limit":
-            value = message.get("value")
-            if value is not None:
-                try:
-                    self.config["upper_limit_counts"] = int(value)
-                    save_config(self.config)
-                except (TypeError, ValueError):
-                    pass
-            self.send_upper_limit()
-            await self.broadcast_config()
-
     async def handle_action(self, name: str) -> None:
         if name == "arm_toggle":
             # Never allow ARM before sequence sync / telemetry.
@@ -570,10 +580,6 @@ class RobotBackend:
             self.stop_now()
         elif name == "clear_fault":
             self.pulse_flag(FLAG_CLEAR_FAULT)
-        elif name == "home":
-            self.pulse_flag(FLAG_HOME)
-        elif name == "calibrate":
-            self.pulse_flag(FLAG_CALIBRATE)
 
     async def broadcast_config(self) -> None:
         await self.broadcast({"type": "config", "config": self.config})

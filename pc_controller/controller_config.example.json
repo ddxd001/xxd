@@ -1,8 +1,8 @@
 {
   "com_port": "COM3",
   "baud": 115200,
-  "upper_limit_counts": 0,
   "speed_scale": 0.2,
+  "lift_speed_scale": 0.6,
   "gamepad_deadzone": 0.12,
   "gamepad_axes": {
     "left_x": 0,
@@ -13,6 +13,10 @@
     "left_shoulder": 4,
     "right_shoulder": 5,
     "start": 7,
-    "stop": 1
+    "stop": 1,
+    "face_startup": 2,
+    "face_charge_start": 3,
+    "face_charge_complete": 0,
+    "face_safe_dock": 1
   }
 }

@@ -20,6 +20,17 @@ extern const timer_cfg_t g_system_tick_cfg;
 void system_tick_callback(timer_callback_args_t *p_args);
 #endif
 /** UART on SCI Instance. */
+extern const uart_instance_t g_linux_uart;
+
+/** Access the UART instance using these structures when calling API functions directly (::p_api is not used). */
+extern sci_b_uart_instance_ctrl_t g_linux_uart_ctrl;
+extern const uart_cfg_t g_linux_uart_cfg;
+extern const sci_b_uart_extended_cfg_t g_linux_uart_cfg_extend;
+
+#ifndef linux_uart_callback
+void linux_uart_callback(uart_callback_args_t *p_args);
+#endif
+/** UART on SCI Instance. */
 extern const uart_instance_t g_uart8;
 
 /** Access the UART instance using these structures when calling API functions directly (::p_api is not used). */
