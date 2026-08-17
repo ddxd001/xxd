@@ -125,6 +125,10 @@
 
 重新实现或调试上位机前，请先阅读[上位机软件接口文档](docs/PC_SOFTWARE_INTERFACE.md)。文档包含当前 v3 二进制协议、控制序号同步、85 字节遥测布局、状态/故障定义及 LoRa 半双工发送时序。
 
+### 新电脑一键部署
+
+在仓库根目录用 PowerShell 运行 `pc_controller/setup.ps1`，自动完成：Python（缺失时用 winget 安装）→ `requirements.txt` 依赖 → Git for Windows → Kimi Code CLI（官方脚本）→ 聊天技能（`skills/ra8p1-robot` 和 `skills/box2robot-skills` 都已收进仓库，脚本直接复制到 Kimi Code 用户目录）→ 聊天工作目录。脚本只装环境，以下三步需手动：Kimi Code 首次登录（运行 `kimi` 后输入 `/login`）、Box2Robot 账号登录（`python ~/.kimi-code/skills/box2robot-skills/b2r.py login <用户名> <密码>`）、LoRa 的 CH340/CH343 驱动（Win10/11 一般自动安装）。固件构建烧录不在脚本范围，见下文"构建与烧录"。
+
 ```powershell
 cd pc_controller
 py -m pip install -r requirements.txt

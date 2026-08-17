@@ -239,6 +239,7 @@ class RobotBackend:
         self.tx_next_slot = 0
 
         self.motion = (0.0, 0.0, 0.0, 0.0)  # raw -1..1 intent from the browser
+        self.chat_motion = None  # (values, expires_at) timed override from the chat assistant
         self.last_client_msg_at = 0.0
         self.serial_error: str | None = None
         self.write_failures = 0
@@ -314,6 +315,7 @@ class RobotBackend:
         self.telemetry = None
         self.pending_face_event = None
         self.motion = (0.0, 0.0, 0.0, 0.0)
+        self.chat_motion = None
 
     def _reader_loop(self) -> None:
         parser = FrameParser()
@@ -383,10 +385,19 @@ class RobotBackend:
         self.tx_next_slot += 1
         return slot
 
+    def _effective_motion(self) -> tuple:
+        """Chat-commanded timed motion wins over browser input until it expires."""
+        if self.chat_motion is not None:
+            values, expires_at = self.chat_motion
+            if time.monotonic() < expires_at:
+                return values
+            self.chat_motion = None
+        return self.motion
+
     def _scaled_motion(self) -> tuple[int, int, int, int]:
         chassis_scale = max(0.05, min(1.0, float(self.config.get("speed_scale", 0.2))))
         lift_scale = max(0.10, min(1.0, float(self.config.get("lift_speed_scale", 0.6))))
-        vx, vy, omega, lift = (max(-1.0, min(1.0, value)) for value in self.motion)
+        vx, vy, omega, lift = (max(-1.0, min(1.0, value)) for value in self._effective_motion())
         return (
             int(round(vx * chassis_scale * 1000.0)),
             int(round(vy * chassis_scale * 1000.0)),
@@ -422,6 +433,20 @@ class RobotBackend:
 
     def pulse_flag(self, flag: int) -> None:
         self.pending_flags |= flag
+
+    def set_chat_motion(self, vx, vy, omega, lift, duration_ms) -> str | None:
+        """Timed motion pulse from the chat assistant. Returns an error string, or None."""
+        if self.port is None or not self.sequence_synced:
+            return "串口未连接或控制序号尚未同步"
+        if self.telemetry is None or time.monotonic() - self.last_telemetry_at > 1.0:
+            return "遥测失联，拒绝聊天运动指令"
+        try:
+            values = tuple(max(-1.0, min(1.0, float(v))) for v in (vx, vy, omega, lift))
+            ms = max(100, min(3000, int(duration_ms)))
+        except (TypeError, ValueError):
+            return "参数无效：分量须在 -1~1，时长须为毫秒整数"
+        self.chat_motion = (values, time.monotonic() + ms / 1000.0)
+        return None
 
     async def queue_face_event(self, code) -> None:
         if self.port is None or not self.sequence_synced:
@@ -589,6 +614,68 @@ async def index(_request: web.Request) -> web.StreamResponse:
     return web.FileResponse(INDEX_PATH)
 
 
+# -------- HTTP API for the chat assistant's ra8p1.py CLI --------
+# Same safety gating as the WebSocket path; all commands funnel into the
+# single RobotBackend sender, so frame sequencing stays centralized.
+
+async def api_state(request: web.Request) -> web.Response:
+    backend: RobotBackend = request.app["backend"]
+    data = backend.connection_state()
+    data["telemetry"] = telemetry_to_dict(backend.telemetry) if backend.telemetry else None
+    data["telemetry_fresh"] = (
+        backend.telemetry is not None and time.monotonic() - backend.last_telemetry_at < 1.0
+    )
+    return web.json_response(data)
+
+
+async def api_action(request: web.Request) -> web.Response:
+    backend: RobotBackend = request.app["backend"]
+    try:
+        body = await request.json()
+    except ValueError:
+        body = {}
+    name = str(body.get("name", ""))
+    if name == "stop":
+        backend.stop_now()
+        return web.json_response({"ok": True})
+    if name == "clear_fault":
+        backend.pulse_flag(FLAG_CLEAR_FAULT)
+        return web.json_response({"ok": True})
+    if name == "arm_toggle":
+        if backend.telemetry is None or not backend.sequence_synced:
+            return web.json_response({"ok": False, "error": "尚未收到遥测，禁止使能"}, status=409)
+        backend.toggle_arm()
+        return web.json_response({"ok": True})
+    if name == "face_event":
+        if backend.port is None or not backend.sequence_synced:
+            return web.json_response({"ok": False, "error": "串口未连接或控制序号尚未同步"}, status=409)
+        try:
+            code = int(body.get("code"))
+        except (TypeError, ValueError):
+            code = -1
+        if not 0 <= code <= 0x0A:
+            return web.json_response({"ok": False, "error": "事件代码必须是 0～10"}, status=400)
+        backend.pending_face_event = code
+        await backend.broadcast({"type": "face_event_status", "state": "queued", "code": code})
+        return web.json_response({"ok": True, "queued": code})
+    return web.json_response({"ok": False, "error": f"未知动作：{name}"}, status=400)
+
+
+async def api_motion(request: web.Request) -> web.Response:
+    backend: RobotBackend = request.app["backend"]
+    try:
+        body = await request.json()
+    except ValueError:
+        return web.json_response({"ok": False, "error": "请求体必须是 JSON"}, status=400)
+    error = backend.set_chat_motion(
+        body.get("vx", 0), body.get("vy", 0), body.get("omega", 0), body.get("lift", 0),
+        body.get("duration_ms", 1000),
+    )
+    if error:
+        return web.json_response({"ok": False, "error": error}, status=409)
+    return web.json_response({"ok": True})
+
+
 async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
     backend: RobotBackend = request.app["backend"]
     ws = web.WebSocketResponse(heartbeat=20)
@@ -628,6 +715,9 @@ def main() -> None:
     app = web.Application()
     app["backend"] = backend
     app.router.add_get("/", index)
+    app.router.add_get("/api/state", api_state)
+    app.router.add_post("/api/action", api_action)
+    app.router.add_post("/api/motion", api_motion)
     app.router.add_get("/ws", websocket_handler)
     app.router.add_static("/assets/", BASE_DIR / "web", show_index=False)
     app.router.add_get("/favicon.ico", lambda _r: web.Response(status=204))
@@ -635,6 +725,15 @@ def main() -> None:
 
     async def start_tasks(app_: web.Application) -> None:
         backend.loop = asyncio.get_running_loop()
+
+        def _quiet_exceptions(loop_: asyncio.AbstractEventLoop, context: dict) -> None:
+            # Browser tabs closing abruptly flood the log with WinError 10054
+            # from _ProactorBasePipeTransport; it is harmless — drop it.
+            if isinstance(context.get("exception"), ConnectionResetError):
+                return
+            loop_.default_exception_handler(context)
+
+        backend.loop.set_exception_handler(_quiet_exceptions)
         app_["tasks"] = [
             asyncio.create_task(backend.rx_pump()),
             asyncio.create_task(backend.tx_loop()),
