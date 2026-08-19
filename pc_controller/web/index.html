@@ -285,6 +285,17 @@
   .btn-row:last-child { margin-bottom: 0; }
   .btn-row button { min-height: 42px; font-size: 15px; padding: 9px 20px; }
   #btn-stop { padding: 12px 26px; font-size: 16px; font-weight: 600; }
+  #btn-task { padding: 12px 26px; font-size: 16px; font-weight: 600; }
+  #btn-task.running { background: #ff9f0a; }
+
+  /* one-click task progress */
+  .task-progress {
+    border: 1px solid var(--border); border-radius: 12px;
+    padding: 10px 12px; margin-bottom: 12px; font-size: 14px;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .task-progress .task-title { font-weight: 600; }
+  .task-progress .task-note-line { color: var(--text-secondary); font-size: 13px; }
 
   .field-row {
     display: flex; align-items: center; gap: 10px;
@@ -650,6 +661,14 @@
   <div class="btn-row">
     <button id="btn-clear-fault">清除故障</button>
   </div>
+  <div class="btn-row">
+    <button class="primary" id="btn-task">▶ 一键任务（自动充电演示）</button>
+  </div>
+  <div class="task-progress" id="task-progress" hidden>
+    <div class="task-title" id="task-title">任务进行中…</div>
+    <div class="task-note-line" id="task-voice">语音：—</div>
+    <div class="task-note-line" id="task-note"></div>
+  </div>
   <div class="field-row">
     <span class="field-label">底盘速度</span>
     <input type="range" id="speed-slider" min="5" max="100" step="1" value="20" aria-label="底盘速度">
@@ -896,6 +915,18 @@ function handleMessage(msg) {
       chatEndTurn();
       $("chat-log").innerHTML = "";
       chatAdd("sys", "已开始新会话（助手上下文已清空）。");
+      break;
+    case "task_status":
+      taskOnStatus(msg);
+      break;
+    case "task_motion":
+      taskOnMotion(msg);
+      break;
+    case "task_voice":
+      taskOnVoice(msg);
+      break;
+    case "task_note":
+      taskOnNote(msg);
       break;
     case "error":
       toast(msg.message || "操作失败");
@@ -1159,6 +1190,52 @@ function queueFaceEvent(code) {
 }
 $("btn-face-event").onclick = () => {
   queueFaceEvent(Number.parseInt($("face-event-select").value, 10));
+};
+
+/* ================= one-click task ================= */
+let taskRunning = false;
+let taskSimMotion = null; // {values:{vx,vy,omega,lift}, until:performance ms}
+
+function taskOnStatus(msg) {
+  const btn = $("btn-task");
+  if (msg.state === "running") {
+    if (!taskRunning) {
+      taskRunning = true;
+      if (window.__robotTask) window.__robotTask.start();
+      $("task-progress").hidden = false;
+    }
+    btn.textContent = "■ 取消任务";
+    btn.classList.add("running");
+    $("task-title").textContent =
+      `任务进行中 ${msg.step}/${msg.total}：${msg.label}` + (msg.live ? "" : "（演示模式）");
+    $("task-note").textContent = "";
+  } else if (msg.state !== "busy") {
+    taskRunning = false;
+    taskSimMotion = null;
+    if (window.__robotTask) window.__robotTask.stop();
+    btn.textContent = "▶ 一键任务（自动充电演示）";
+    btn.classList.remove("running");
+    $("task-title").textContent = msg.label || "";
+    toast(msg.label || "");
+    setTimeout(() => { if (!taskRunning) $("task-progress").hidden = true; }, 5000);
+  } else {
+    toast(msg.label || "任务忙");
+  }
+}
+function taskOnMotion(msg) {
+  taskSimMotion = {
+    values: { vx: Number(msg.vx) || 0, vy: 0, omega: Number(msg.omega) || 0, lift: 0 },
+    until: performance.now() + Math.max(0, Number(msg.ms) || 0),
+  };
+}
+function taskOnVoice(msg) {
+  $("task-voice").textContent = `语音：${msg.label}` + (msg.live ? "（已下发）" : "（演示，未下发）");
+}
+function taskOnNote(msg) {
+  $("task-note").textContent = msg.text || "";
+}
+$("btn-task").onclick = () => {
+  if (!send({ type: taskRunning ? "stop_task" : "start_task" })) toast("与服务器断开，无法操作任务");
 };
 
 $("btn-connect").onclick = () => {
@@ -1570,7 +1647,8 @@ if (new URLSearchParams(location.search).has("chatdemo")) {
 /* ================= bridge for the 3D module ================= */
 let latestMotion = { vx: 0, vy: 0, omega: 0, lift: 0 };
 window.__robotApp = {
-  getMotion: () => latestMotion,
+  getMotion: () =>
+    taskSimMotion && performance.now() < taskSimMotion.until ? taskSimMotion.values : latestMotion,
   getTelemetry: () =>
     telemetry && performance.now() - lastTelemetryAt < 1000 && connected ? telemetry : null,
   onThemeChange: (cb) => themeListeners.push(cb),

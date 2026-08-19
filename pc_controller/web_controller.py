@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import queue
 import shutil
+import sys
 import threading
 import time
 
@@ -61,6 +62,28 @@ DEFAULT_CONFIG = {
         "face_charge_start": 3,
         "face_charge_complete": 0,
         "face_safe_dock": 1,
+    },
+    # 一键任务（自动充电演示）：底盘定时脉冲 + 语音事件 + 机械臂预制动作。
+    # 各时长单位秒；sim_* 只影响 3D 演示动画，实物速度仍由 speed_scale 决定。
+    "task": {
+        "forward_to_pile_s": 3.5,      # 原地出发，前进到充电桩
+        "turn_s": 4.5,                 # 原地右转 ~90°（已按实车标定）
+        "forward_to_car_s": 11.0,      # 右转后前进到汽车旁
+        "arm_action_code": "TASK-20260420-001",  # ACT Store 预制动作（向左边张嘴），取枪/插枪共用
+        "arm_device": "B2R-2805A54FE4B4",        # 执行动作的机械臂（左臂）
+        "arm_action_s": 12.0,          # 等待机械臂动作完成的时长
+        "sim_move": 0.22,              # 3D 演示平移速度（满幅的比例，按行程适配场地）
+        "sim_turn": 0.205,             # 3D 演示转向速度（约 90°/turn_s）
+        # 每条语音的完整播放时长：Linux 端收到新事件会重启语音，
+        # 因此下一条语音必须等上一条播完这么久之后再发。
+        "voice_play_s": {
+            "1": 3.0,   # 启动
+            "3": 2.0,   # 机器人移动中
+            "5": 2.0,   # 请停止
+            "6": 2.5,   # 开始充电
+            "9": 2.5,   # 任务完成
+            "10": 2.0,  # 安全停靠
+        },
     },
 }
 
@@ -244,6 +267,8 @@ class RobotBackend:
         self.serial_error: str | None = None
         self.write_failures = 0
         self.chat = ChatBridge()
+        self.task_run: asyncio.Task | None = None  # one-click task choreography
+        self._task_last_voice: tuple[int, float] | None = None  # (code, 发出的 monotonic 时刻)
 
     # ------------------------------------------------------------------ serial
 
@@ -299,6 +324,9 @@ class RobotBackend:
         return None
 
     async def disconnect(self, safe_stop: bool = True) -> None:
+        if self.task_running():
+            self.task_run.cancel()
+            self.task_run = None
         if safe_stop and self.port is not None:
             await self._send_safe_stop(3)
         self.reader_stop.set()
@@ -466,6 +494,161 @@ class RobotBackend:
         active = self.telemetry is not None and self.telemetry.state in (1, 3, 5, 6)
         self.pulse_flag(FLAG_DISARM if active else FLAG_ARM)
 
+    # ------------------------------------------------------------ one-click task
+
+    def task_running(self) -> bool:
+        return self.task_run is not None and not self.task_run.done()
+
+    def _link_live(self) -> bool:
+        """真实链路可用（非演示模式）：串口已连接且遥测新鲜。"""
+        return (
+            self.port is not None
+            and self.sequence_synced
+            and self.telemetry is not None
+            and time.monotonic() - self.last_telemetry_at < 1.0
+        )
+
+    async def start_one_click_task(self) -> None:
+        if self.task_running():
+            await self.broadcast({"type": "task_status", "state": "busy", "label": "任务已在进行中"})
+            return
+        self.task_run = asyncio.create_task(self._run_task())
+
+    async def cancel_one_click_task(self, reason: str = "手动中断") -> None:
+        if not self.task_running():
+            return
+        self.task_run.cancel()
+        try:
+            await self.task_run
+        except (asyncio.CancelledError, Exception):
+            pass
+        self.task_run = None
+
+    def _voice_play_s(self, code: int) -> float:
+        cfg = dict(DEFAULT_CONFIG["task"], **(self.config.get("task") or {}))
+        table = cfg.get("voice_play_s") or {}
+        try:
+            return float(table.get(str(code), 2.0))
+        except (TypeError, ValueError):
+            return 2.0
+
+    async def _task_say(self, code: int, label: str, wait_prev: bool = True) -> None:
+        """排队一个屏幕/语音事件；演示模式下只在界面上显示，不下发。
+
+        Linux 端收到新事件会重启语音，因此默认先等上一条语音播完再发；
+        「请停止」这类中断提示用 wait_prev=False 立即打断。
+        """
+        if wait_prev and self._task_last_voice is not None:
+            prev_code, prev_at = self._task_last_voice
+            remaining = self._voice_play_s(prev_code) - (time.monotonic() - prev_at)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+        live = self.port is not None and self.sequence_synced
+        if live:
+            self.pending_face_event = code
+            await self.broadcast({"type": "face_event_status", "state": "queued", "code": code})
+        await self.broadcast({"type": "task_voice", "code": code, "label": label, "live": live})
+        self._task_last_voice = (code, time.monotonic())
+
+    async def _task_move(self, vx: float, omega: float, seconds: float,
+                         sim_vx: float, sim_omega: float) -> None:
+        """一段定时运动：实物走 set_chat_motion 安全脉冲（≤3s 切片），3D 由 task_motion 驱动。"""
+        ms = max(0, int(seconds * 1000))
+        await self.broadcast({"type": "task_motion", "vx": sim_vx, "omega": sim_omega, "ms": ms})
+        if self._link_live():
+            remaining = ms
+            while remaining > 0:
+                pulse = min(remaining, 2500)
+                error = self.set_chat_motion(vx, 0, omega, 0, pulse)
+                if error:
+                    raise RuntimeError(f"运动指令被拒绝：{error}")
+                await asyncio.sleep(pulse / 1000.0)
+                remaining -= pulse
+        else:
+            await asyncio.sleep(seconds)
+
+    async def _task_arm_action(self, code: str, device: str, wait_s: float) -> None:
+        """执行 Box2Robot ACT Store 预制动作；失败只提示，不中断任务。"""
+        b2r = Path.home() / ".kimi-code" / "skills" / "box2robot-skills" / "b2r.py"
+        if code and device and b2r.exists():
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, str(b2r), "store", "run", code, device,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                )
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+                text = " ".join(out.decode("utf-8", "replace").split())
+                if proc.returncode == 0 and '"error"' not in text:
+                    await self.broadcast({"type": "task_note", "text": "机械臂动作已下发"})
+                else:
+                    await self.broadcast({"type": "task_note", "text": f"机械臂动作未执行：{text[:150]}"})
+            except Exception as exc:
+                await self.broadcast({"type": "task_note", "text": f"机械臂动作调用失败：{exc}"})
+        else:
+            await self.broadcast({"type": "task_note", "text": "未配置机械臂动作，跳过实物执行（仅 3D 动画）"})
+        await asyncio.sleep(max(0.0, wait_s))  # 云端异步执行，留足动作完成时间
+
+    async def _run_task(self) -> None:
+        cfg = dict(DEFAULT_CONFIG["task"], **(self.config.get("task") or {}))
+        fwd_pile = float(cfg["forward_to_pile_s"])
+        turn = float(cfg["turn_s"])
+        fwd_car = float(cfg["forward_to_car_s"])
+        arm_s = float(cfg["arm_action_s"])
+        arm_code = str(cfg.get("arm_action_code") or "")
+        arm_dev = str(cfg.get("arm_device") or "")
+        sim_move = float(cfg["sim_move"])
+        sim_turn = float(cfg["sim_turn"])
+        steps = 6
+
+        async def phase(index: int, key: str, label: str) -> None:
+            await self.broadcast({
+                "type": "task_status", "state": "running", "phase": key,
+                "label": label, "step": index, "total": steps,
+                "live": self._link_live(),
+            })
+
+        try:
+            self._task_last_voice = None
+            await phase(1, "start", "回到原点，任务启动")
+            await self._task_say(0x01, "启动")
+
+            await phase(2, "to_pile", "前往充电桩")
+            await self._task_say(0x03, "机器人移动中")
+            await self._task_move(1.0, 0.0, fwd_pile, sim_move, 0.0)
+
+            await phase(3, "pick", "取电枪（机械臂）")
+            await self._task_arm_action(arm_code, arm_dev, arm_s)
+
+            await phase(4, "to_car", "前往汽车")
+            await self._task_say(0x03, "机器人移动中")
+            await self._task_move(0.0, -1.0, turn, 0.0, -sim_turn)   # 右转 ~90°
+            await self._task_move(1.0, 0.0, fwd_car, sim_move, 0.0)
+
+            await phase(5, "insert", "插枪充电（机械臂）")
+            await self._task_say(0x06, "开始充电")
+            await self._task_arm_action(arm_code, arm_dev, arm_s)
+
+            await phase(6, "return", "原路返回")
+            await self._task_say(0x03, "机器人移动中")
+            await self._task_move(-1.0, 0.0, fwd_car, -sim_move, 0.0)  # 后退 4s
+            await self._task_move(0.0, 1.0, turn, 0.0, sim_turn)       # 左转回正
+            await self._task_move(-1.0, 0.0, fwd_pile, -sim_move, 0.0) # 后退 2s 回原点
+
+            await self._task_say(0x09, "任务完成")
+            await self._task_say(0x0A, "安全停靠")
+            await asyncio.sleep(self._voice_play_s(0x0A))  # 等最后一条语音播完再落幕
+            await self.broadcast({"type": "task_status", "state": "done", "label": "任务完成，已安全停靠"})
+        except asyncio.CancelledError:
+            self.chat_motion = None
+            self.stop_now()
+            await self._task_say(0x05, "请停止", wait_prev=False)  # 中断提示立即打断当前语音
+            await self.broadcast({"type": "task_status", "state": "cancelled", "label": "任务已中断，机器人已停用"})
+            raise
+        except Exception as exc:
+            self.chat_motion = None
+            self.stop_now()
+            await self.broadcast({"type": "task_status", "state": "error", "label": f"任务中断：{exc}"})
+
     # -------------------------------------------------------------- async loops
 
     async def rx_pump(self) -> None:
@@ -575,6 +758,7 @@ class RobotBackend:
             else:
                 await self.handle_action(str(message.get("name", "")))
         elif kind == "safe_stop":
+            await self.cancel_one_click_task("安全停用")
             await self._send_safe_stop(3)
         elif kind == "chat":
             text = str(message.get("text", "")).strip()
@@ -586,6 +770,10 @@ class RobotBackend:
         elif kind == "chat_reset":
             self.chat.session_id = None
             await self.broadcast({"type": "chat_reset_done"})
+        elif kind == "start_task":
+            await self.start_one_click_task()
+        elif kind == "stop_task":
+            await self.cancel_one_click_task()
         elif kind == "set_config":
             if "speed_scale" in message:
                 self.config["speed_scale"] = max(0.05, min(1.0, float(message["speed_scale"])))
@@ -602,6 +790,7 @@ class RobotBackend:
                 return
             self.toggle_arm()
         elif name == "stop":
+            await self.cancel_one_click_task("立即停用")
             self.stop_now()
         elif name == "clear_fault":
             self.pulse_flag(FLAG_CLEAR_FAULT)
@@ -701,7 +890,8 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
     finally:
         backend.clients.discard(ws)
         if not backend.clients and backend.port is not None:
-            # Last browser left: clear inputs and send the safe-stop burst.
+            # Last browser left: cancel any running task, clear inputs, safe-stop.
+            await backend.cancel_one_click_task("浏览器已关闭")
             await backend._send_safe_stop(3)
     return ws
 

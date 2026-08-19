@@ -181,6 +181,75 @@ function boot() {
     arms[side] = arm;
   }
 
+  /* ------------- one-click task props: charging pile + car -------------
+   * Visible only while the one-click task runs. Positions match the backend
+   * choreography at sim_move 0.22 (MOVE_SPEED 2.4 u/s): the pile stands 1.2 u
+   * beyond the 3.5 s stop point, the car parks parallel on the robot's left
+   * (+Z) side of the 11 s stop point — the arm action opens to the left. */
+  const pileStop = 3.5 * MOVE_SPEED * 0.22;          // robot stop distance 1.85
+  const carStop = 11.0 * MOVE_SPEED * 0.22;          // robot stop distance 5.81
+
+  const taskProps = new THREE.Group();
+  taskProps.visible = false;
+  scene.add(taskProps);
+
+  // charging pile: white column + blue screen + holstered gun + cable loop
+  const pile = new THREE.Group();
+  pile.position.set(0, 0, pileStop + 1.2);
+  const pileBody = box(0.5, 1.7, 0.35, white);
+  pileBody.position.y = 0.85;
+  pile.add(pileBody);
+  const pileBase = box(0.7, 0.12, 0.55, lightGray);
+  pileBase.position.y = 0.06;
+  pile.add(pileBase);
+  const pileScreen = box(0.3, 0.22, 0.03, accentBlue);
+  pileScreen.position.set(0, 1.28, -0.19);           // faces the arriving robot (-Z)
+  pile.add(pileScreen);
+  const pileGun = box(0.1, 0.24, 0.12, darkGray);
+  pileGun.position.set(0.31, 0.95, 0);               // robot's left (+X) side
+  pile.add(pileGun);
+  const pileCable = new THREE.Mesh(new THREE.TorusGeometry(0.16, 0.025, 10, 32), darkGray);
+  pileCable.position.set(0.31, 0.66, 0);
+  pileCable.castShadow = true;
+  pile.add(pileCable);
+  taskProps.add(pile);
+
+  // car: body + cabin + four wheels, length along X, charge port toward the path
+  const carPaint = new THREE.MeshStandardMaterial({ color: 0x0a84ff, roughness: 0.35, metalness: 0.25 });
+  const carGlass = new THREE.MeshStandardMaterial({ color: 0x1c1c1e, roughness: 0.15, metalness: 0.6 });
+  const car = new THREE.Group();
+  car.position.set(-carStop, 0, pileStop + 1.7);     // left of the robot's stop point
+  const carBody = box(3.1, 0.55, 1.5, carPaint);
+  carBody.position.y = 0.58;
+  car.add(carBody);
+  const carCabin = box(1.6, 0.48, 1.34, carGlass);
+  carCabin.position.set(-0.25, 1.08, 0);
+  car.add(carCabin);
+  for (const sx of [-1, 1]) {
+    for (const sz of [-1, 1]) {
+      const wheelM = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.32, 0.22, 24), darkGray);
+      wheelM.rotation.x = Math.PI / 2;               // axle along Z
+      wheelM.position.set(sx * 1.05, 0.32, sz * 0.78);
+      wheelM.castShadow = true;
+      car.add(wheelM);
+    }
+  }
+  const chargePort = box(0.26, 0.18, 0.03, accentBlue);
+  chargePort.position.set(0.9, 0.62, -0.76);         // on the side facing the robot
+  car.add(chargePort);
+  taskProps.add(car);
+
+  function taskStart() {
+    robot.position.set(0, 0, 0);
+    yaw = 0;
+    robot.rotation.y = 0;
+    taskProps.visible = true;
+  }
+  function taskStop() {
+    taskProps.visible = false;
+  }
+  window.__robotTask = { start: taskStart, stop: taskStop };
+
   /* ---------------- theme ---------------- */
   function applyTheme(theme) {
     const dark = theme === "dark";
