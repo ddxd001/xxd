@@ -242,7 +242,9 @@ function boot() {
   function taskStart() {
     robot.position.set(0, 0, 0);
     yaw = 0;
+    liftNorm = 0;                        // 升降台也回零
     robot.rotation.y = 0;
+    liftGroup.position.y = LIFT_REST;
     taskProps.visible = true;
   }
   function taskStop() {

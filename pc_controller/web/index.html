@@ -1224,7 +1224,10 @@ function taskOnStatus(msg) {
 }
 function taskOnMotion(msg) {
   taskSimMotion = {
-    values: { vx: Number(msg.vx) || 0, vy: 0, omega: Number(msg.omega) || 0, lift: 0 },
+    values: {
+      vx: Number(msg.vx) || 0, vy: 0,
+      omega: Number(msg.omega) || 0, lift: Number(msg.lift) || 0,
+    },
     until: performance.now() + Math.max(0, Number(msg.ms) || 0),
   };
 }

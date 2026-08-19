@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import shutil
 import sys
 import threading
@@ -70,8 +71,12 @@ DEFAULT_CONFIG = {
         "turn_s": 4.5,                 # 原地右转 ~90°（已按实车标定）
         "forward_to_car_s": 11.0,      # 右转后前进到汽车旁
         "arm_action_code": "TASK-20260420-001",  # ACT Store 预制动作（向左边张嘴），取枪/插枪共用
-        "arm_device": "B2R-2805A54FE4B4",        # 执行动作的机械臂（左臂）
-        "arm_action_s": 12.0,          # 等待机械臂动作完成的时长
+        # 一键任务中执行动作的机械臂（单臂：左臂）
+        "arm_device": "B2R-2805A54FE4B4",
+        # 聊天快捷动作执行的机械臂（左右两臂同时执行同一动作，保持同步）
+        "arm_devices": ["B2R-2805A54FE4B4", "B2R-2805A54E0140"],
+        "arm_action_s": 10.0,          # 等待机械臂动作完成的时长
+        "lift_up_s": 2.5,              # 到桩后、取枪前，升降台升高时长
         "sim_move": 0.22,              # 3D 演示平移速度（满幅的比例，按行程适配场地）
         "sim_turn": 0.205,             # 3D 演示转向速度（约 90°/turn_s）
         # 每条语音的完整播放时长：Linux 端收到新事件会重启语音，
@@ -84,6 +89,21 @@ DEFAULT_CONFIG = {
             "9": 2.5,   # 任务完成
             "10": 2.0,  # 安全停靠
         },
+    },
+    # 聊天助手快捷动作：消息与键名完全一致时跳过 Kimi 大模型，
+    # 直接在 task.arm_devices 指定的机械臂（默认左右双臂同步）上执行对应 ACT Store 动作。
+    "quick_actions": {
+        "伸懒腰": "TASK-20260420-008",
+        "张嘴": "TASK-20260420-007",
+        "向左边张嘴": "TASK-20260420-001",
+        "向右边张嘴": "TASK-20260420-002",
+        "点头": "TASK-20260420-006",
+        "点头yes": "TASK-20260420-006",
+        "挥手": "TASK-20260420-005",
+        "挥挥手": "TASK-20260420-005",
+        "朝左边点头": "TASK-20260420-004",
+        "向右边点头": "TASK-20260420-003",
+        "比爱心": "TASK-20260602-001",
     },
 }
 
@@ -550,16 +570,17 @@ class RobotBackend:
         await self.broadcast({"type": "task_voice", "code": code, "label": label, "live": live})
         self._task_last_voice = (code, time.monotonic())
 
-    async def _task_move(self, vx: float, omega: float, seconds: float,
+    async def _task_move(self, vx: float, omega: float, lift: float, seconds: float,
                          sim_vx: float, sim_omega: float) -> None:
         """一段定时运动：实物走 set_chat_motion 安全脉冲（≤3s 切片），3D 由 task_motion 驱动。"""
         ms = max(0, int(seconds * 1000))
-        await self.broadcast({"type": "task_motion", "vx": sim_vx, "omega": sim_omega, "ms": ms})
+        await self.broadcast({"type": "task_motion", "vx": sim_vx, "omega": sim_omega,
+                              "lift": lift, "ms": ms})
         if self._link_live():
             remaining = ms
             while remaining > 0:
                 pulse = min(remaining, 2500)
-                error = self.set_chat_motion(vx, 0, omega, 0, pulse)
+                error = self.set_chat_motion(vx, 0, omega, lift, pulse)
                 if error:
                     raise RuntimeError(f"运动指令被拒绝：{error}")
                 await asyncio.sleep(pulse / 1000.0)
@@ -567,10 +588,22 @@ class RobotBackend:
         else:
             await asyncio.sleep(seconds)
 
-    async def _task_arm_action(self, code: str, device: str, wait_s: float) -> None:
-        """执行 Box2Robot ACT Store 预制动作；失败只提示，不中断任务。"""
+    def _arm_devices(self) -> list[str]:
+        """执行动作的机械臂列表：优先 arm_devices，兼容旧的单臂 arm_device。"""
+        cfg = dict(DEFAULT_CONFIG["task"], **(self.config.get("task") or {}))
+        devices = cfg.get("arm_devices")
+        if isinstance(devices, list) and devices:
+            return [str(d) for d in devices]
+        single = str(cfg.get("arm_device") or "")
+        return [single] if single else []
+
+    async def _invoke_store_action(self, code: str, devices: list[str]) -> str | None:
+        """在多台机械臂上并发调用 Box2Robot ACT Store 动作。返回错误文本，成功为 None。"""
         b2r = Path.home() / ".kimi-code" / "skills" / "box2robot-skills" / "b2r.py"
-        if code and device and b2r.exists():
+        if not (code and devices and b2r.exists()):
+            return "未配置机械臂动作或设备"
+
+        async def run_one(device: str) -> str | None:
             try:
                 proc = await asyncio.create_subprocess_exec(
                     sys.executable, str(b2r), "store", "run", code, device,
@@ -579,14 +612,66 @@ class RobotBackend:
                 out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
                 text = " ".join(out.decode("utf-8", "replace").split())
                 if proc.returncode == 0 and '"error"' not in text:
-                    await self.broadcast({"type": "task_note", "text": "机械臂动作已下发"})
-                else:
-                    await self.broadcast({"type": "task_note", "text": f"机械臂动作未执行：{text[:150]}"})
+                    return None
+                return f"{device}: {text[:120]}"
             except Exception as exc:
-                await self.broadcast({"type": "task_note", "text": f"机械臂动作调用失败：{exc}"})
-        else:
+                return f"{device}: {exc}"
+
+        results = await asyncio.gather(*(run_one(d) for d in devices))
+        errors = [r for r in results if r]
+        return "; ".join(errors) if errors else None
+
+    async def _task_arm_action(self, code: str, devices: list[str], wait_s: float) -> None:
+        """执行 Box2Robot ACT Store 预制动作；失败只提示，不中断任务。"""
+        error = await self._invoke_store_action(code, devices)
+        if error is None:
+            await self.broadcast({"type": "task_note", "text": "机械臂动作已下发"})
+        elif "未配置" in error:
             await self.broadcast({"type": "task_note", "text": "未配置机械臂动作，跳过实物执行（仅 3D 动画）"})
+        else:
+            await self.broadcast({"type": "task_note", "text": f"机械臂动作未执行：{error}"})
         await asyncio.sleep(max(0.0, wait_s))  # 云端异步执行，留足动作完成时间
+
+    async def _run_quick_action(self, name: str, code: str) -> None:
+        """聊天框输入预设动作名：跳过 Kimi 大模型，双臂同步直接执行，秒级响应。"""
+        devices = self._arm_devices()
+        await self.broadcast({"type": "chat_delta", "text": f"收到，立即在左右两臂执行「{name}」。"})
+        await self.broadcast({"type": "chat_tool", "text": f"Skill: box2robot / store run {code}（{name}）× 双臂"})
+        error = await self._invoke_store_action(code, devices)
+        if error is None:
+            await self.broadcast({"type": "chat_delta", "text": f"「{name}」已下发，两臂同步开始动作。"})
+        else:
+            await self.broadcast({"type": "chat_delta", "text": f"执行失败：{error}"})
+        await self.broadcast({"type": "chat_done"})
+
+    # 「向左转」「向右转 45」「右转90度」：默认 90°，角度按 turn_s=90° 比例换算时长
+    TURN_RE = re.compile(r"^(向左|向右|左|右)转?\s*(\d+(?:\.\d+)?)?\s*(?:度|°)?$")
+
+    def _parse_turn_command(self, text: str) -> tuple[float, float] | None:
+        m = self.TURN_RE.match(text)
+        if not m:
+            return None
+        sign = 1.0 if m.group(1) in ("向左", "左") else -1.0  # omega 逆时针为正
+        angle = float(m.group(2)) if m.group(2) else 90.0
+        if not 1.0 <= angle <= 360.0:
+            return None
+        return sign, angle
+
+    async def _run_turn_command(self, sign: float, angle: float) -> None:
+        cfg = dict(DEFAULT_CONFIG["task"], **(self.config.get("task") or {}))
+        seconds = float(cfg["turn_s"]) * angle / 90.0
+        sim_omega = sign * float(cfg["sim_turn"])  # 角速度恒定，时长按比例即可
+        side = "左" if sign > 0 else "右"
+        ms = int(seconds * 1000)
+        await self.broadcast({"type": "chat_delta", "text": f"收到，向{side}转 {angle:g}°（约 {seconds:.1f} 秒）。"})
+        await self.broadcast({"type": "chat_tool", "text": f"Skill: ra8p1-robot / move --omega {sign:g} --ms {ms}"})
+        try:
+            await self._task_move(0.0, sign, 0.0, seconds, 0.0, sim_omega)
+            tail = "转动完成。" if self._link_live() else "（演示模式，仅 3D 展示）转动完成。"
+        except Exception as exc:
+            tail = f"转动失败：{exc}"
+        await self.broadcast({"type": "chat_delta", "text": tail})
+        await self.broadcast({"type": "chat_done"})
 
     async def _run_task(self) -> None:
         cfg = dict(DEFAULT_CONFIG["task"], **(self.config.get("task") or {}))
@@ -596,9 +681,11 @@ class RobotBackend:
         arm_s = float(cfg["arm_action_s"])
         arm_code = str(cfg.get("arm_action_code") or "")
         arm_dev = str(cfg.get("arm_device") or "")
+        arm_devs = [arm_dev] if arm_dev else []  # 一键任务：单臂执行
         sim_move = float(cfg["sim_move"])
         sim_turn = float(cfg["sim_turn"])
-        steps = 6
+        lift_up = float(cfg.get("lift_up_s", 1.0))  # 到桩后、取枪前，升降台升高时长
+        steps = 7
 
         async def phase(index: int, key: str, label: str) -> None:
             await self.broadcast({
@@ -614,25 +701,28 @@ class RobotBackend:
 
             await phase(2, "to_pile", "前往充电桩")
             await self._task_say(0x03, "机器人移动中")
-            await self._task_move(1.0, 0.0, fwd_pile, sim_move, 0.0)
+            await self._task_move(1.0, 0.0, 0.0, fwd_pile, sim_move, 0.0)
 
-            await phase(3, "pick", "取电枪（机械臂）")
-            await self._task_arm_action(arm_code, arm_dev, arm_s)
+            await phase(3, "lift", "升高升降台")
+            await self._task_move(0.0, 0.0, 1.0, lift_up, 0.0, 0.0)  # 升降台上升
 
-            await phase(4, "to_car", "前往汽车")
+            await phase(4, "pick", "取电枪（机械臂）")
+            await self._task_arm_action(arm_code, arm_devs, arm_s)
+
+            await phase(5, "to_car", "前往汽车")
             await self._task_say(0x03, "机器人移动中")
-            await self._task_move(0.0, -1.0, turn, 0.0, -sim_turn)   # 右转 ~90°
-            await self._task_move(1.0, 0.0, fwd_car, sim_move, 0.0)
+            await self._task_move(0.0, -1.0, 0.0, turn, 0.0, -sim_turn)   # 右转 ~90°
+            await self._task_move(1.0, 0.0, 0.0, fwd_car, sim_move, 0.0)
 
-            await phase(5, "insert", "插枪充电（机械臂）")
+            await phase(6, "insert", "插枪充电（机械臂）")
             await self._task_say(0x06, "开始充电")
-            await self._task_arm_action(arm_code, arm_dev, arm_s)
+            await self._task_arm_action(arm_code, arm_devs, arm_s)
 
-            await phase(6, "return", "原路返回")
+            await phase(7, "return", "原路返回")
             await self._task_say(0x03, "机器人移动中")
-            await self._task_move(-1.0, 0.0, fwd_car, -sim_move, 0.0)  # 后退 4s
-            await self._task_move(0.0, 1.0, turn, 0.0, sim_turn)       # 左转回正
-            await self._task_move(-1.0, 0.0, fwd_pile, -sim_move, 0.0) # 后退 2s 回原点
+            await self._task_move(-1.0, 0.0, 0.0, fwd_car, -sim_move, 0.0)  # 后退回桩
+            await self._task_move(0.0, 1.0, 0.0, turn, 0.0, sim_turn)       # 左转回正
+            await self._task_move(-1.0, 0.0, 0.0, fwd_pile, -sim_move, 0.0) # 后退回原点
 
             await self._task_say(0x09, "任务完成")
             await self._task_say(0x0A, "安全停靠")
@@ -762,7 +852,15 @@ class RobotBackend:
             await self._send_safe_stop(3)
         elif kind == "chat":
             text = str(message.get("text", "")).strip()
-            if self.chat.busy:
+            quick = (self.config.get("quick_actions") or {}).get(text)
+            turn = self._parse_turn_command(text)
+            if quick:
+                # 预设动作名：跳过 Kimi 大模型往返，直接执行，秒级响应。
+                asyncio.create_task(self._run_quick_action(text, quick))
+            elif turn and not self.task_running():
+                # 转向指令：向左/右转 [角度]，默认 90°，时长按比例换算。
+                asyncio.create_task(self._run_turn_command(*turn))
+            elif self.chat.busy:
                 await self.broadcast({"type": "chat_status", "text": "上一条消息还在处理中，请稍候…"})
             elif text:
                 self.chat.busy = True
