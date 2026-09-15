@@ -1,6 +1,6 @@
 # RA8P1 三轮全向底盘与升降控制
 
-本工程使用 RA8P1 CPU0 和 FSP 6.5.0 裸机状态机，控制 3 个底盘 STS3215 与 1 个升降 STS3215。LoRa 使用 SCI0（115200），URT-2 舵机总线使用 SCI8（1 Mbps），Linux 屏幕/扬声器使用 SCI1（115200），GPT0 提供 1 ms 时基。升降机构不安装下限开关，P502 不接。
+本工程使用 RA8P1 CPU0 和 FSP 6.5.0 裸机状态机，控制 3 个底盘 STS3215 与 1 个升降 STS3215。LoRa 使用 SCI0（115200），URT-2 舵机总线使用 SCI8（1 Mbps），Linux 屏幕/扬声器使用 SCI1（9600），GPT0 提供 1 ms 时基。升降机构不安装下限开关，P502 不接。
 
 ## 硬件接线图
 
@@ -38,7 +38,7 @@
 | LoRa 发送 | P603 / TXD0 | P6-7 | LoRa B 的 RXD | 115200，8N1 |
 | 舵机总线接收 | P500 / RXD8 | P4 | URT-2 的 `RX` | 1 Mbps，8N1 |
 | 舵机总线发送 | P501 / TXD8 | P4 | URT-2 的 `TX` | 1 Mbps，8N1 |
-| Linux 事件发送 | P400 / TXD1 | P8-5 | Linux Pin 10 / UART4_RX | 115200，8N1 |
+| Linux 事件发送 | P400 / TXD1 | P8-5 | Linux Pin 10 / UART4_RX | 9600，8N1 |
 | Linux 预留接收 | P401 / RXD1 | P8-8 | Linux Pin 8 / UART4_TX | 首版不连接 |
 | 未使用 | P502 / IRQ26 | P4 | 不连接 | 固件不读取该引脚 |
 | 信号地 | GND | P10 任一脚或扩展板其他 GND | LoRa、URT-2、Linux、电源负极 | 必须共地 |
@@ -66,7 +66,7 @@
 | P8-8 / P401 / RXD1 | Pin 8 / UART4_TX | 首版不连接，仅为以后双向通信预留 |
 | 3.3 V / 5 V | 不连接 | 两块板分别供电，禁止互接电源轨 |
 
-接口是 3.3 V TTL，不得接 RS-232 电平。Linux 使用 `/dev/ttyS4`、115200、8N1、无流控。上位机选择事件后，RA8P1 只向 Linux 发送一个原始字节 `0x00`～`0x0A`，没有帧头、换行和 ACK；详细命令见 [Linux 屏幕与扬声器接口](docs/LINUX_FACE_AUDIO_INTERFACE.md)。
+接口是 3.3 V TTL，不得接 RS-232 电平。Linux 使用 `/dev/ttyS4`、9600、8N1、无流控。上位机选择事件后，RA8P1 只向 Linux 发送一个原始字节 `0x00`～`0x0A`，没有帧头、换行和 ACK；详细命令见 [Linux 屏幕与扬声器接口](docs/LINUX_FACE_AUDIO_INTERFACE.md)。
 
 ### URT-2 与四个 STS3215 接线
 
